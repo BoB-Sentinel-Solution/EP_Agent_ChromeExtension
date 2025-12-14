@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "Sentinel LLM Logger",
-  "version": "0.1.0",
+  "name": "Sentinel CE Agent",
+  "version": "1.0.0",
   "description": "Send LLM prompt logs to Sentinel Server using fixed JSON schema.",
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>"],
@@ -35,7 +35,7 @@
         "https://console.groq.com/*",
 
         
-        
+
         "https://grok.com/*",
 
         "https://www.perplexity.ai/*",
