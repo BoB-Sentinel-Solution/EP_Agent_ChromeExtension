@@ -1,7 +1,7 @@
 // src/background/sw.js
 console.log("[sentinel] sw loaded");
 
-// ✅ inject.js와 동일 키
+// inject.js와 동일 키
 const STORAGE_KEYS = {
   enabled: "sentinel_enabled",
   endpointUrl: "sentinel_endpoint_url",
@@ -23,48 +23,9 @@ async function getSettings() {
   };
 }
 
-function uuidv4() {
-  const buf = new Uint8Array(16);
-  crypto.getRandomValues(buf);
-  buf[6] = (buf[6] & 0x0f) | 0x40;
-  buf[8] = (buf[8] & 0x3f) | 0x80;
-
-  const hex = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
-  return (
-    hex.slice(0, 8) + "-" +
-    hex.slice(8, 12) + "-" +
-    hex.slice(12, 16) + "-" +
-    hex.slice(16, 20) + "-" +
-    hex.slice(20)
-  );
-}
-
-// ✅ PCName 고정: "CE-" + uuid 앞 8자리 (inject.js와 동일 로직)
-async function ensureIdentity() {
-  const data = await chrome.storage.local.get([
-    STORAGE_KEYS.pcName,
-    STORAGE_KEYS.uuid,
-  ]);
-
-  if (data[STORAGE_KEYS.pcName]) {
-    return { pcName: data[STORAGE_KEYS.pcName] };
-  }
-
-  const u = data[STORAGE_KEYS.uuid] || uuidv4();
-  const pcName = "CE-" + String(u).replace(/-/g, "").slice(0, 8);
-
-  await chrome.storage.local.set({
-    [STORAGE_KEYS.uuid]: u,
-    [STORAGE_KEYS.pcName]: pcName,
-  });
-
-  console.log("[sentinel] identity created (sw):", pcName);
-  return { pcName };
-}
-
 async function postJson(url, payload) {
   console.log("[sentinel] POST ->", url);
-  console.log("[sentinel] payload ->", payload); // ✅ 최종 JSON 확인
+  console.log("[sentinel] payload ->", payload);
 
   let res;
   try {
@@ -79,21 +40,25 @@ async function postJson(url, payload) {
   }
 
   const text = await res.text().catch(() => "");
-  console.log("[sentinel] POST result:", res.status, text.slice(0, 200));
-  return { ok: res.ok, status: res.status, text };
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+
+  console.log("[sentinel] POST result:", res.status, (text || "").slice(0, 200));
+  return { ok: res.ok, status: res.status, text, data };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
-      if (!msg || msg.type !== "SENTINEL_LOG") return;
+      if (!msg) return;
 
-      console.log(
-        "[sentinel] onMessage:",
-        msg.type,
-        "from",
-        sender?.url || "unknown"
-      );
+      if (msg.type !== "SENTINEL_PROCESS") return;
+
+      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
 
       const settings = await getSettings();
       if (!settings.enabled) {
@@ -101,15 +66,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
 
-      // ✅ PCName 저장 보장(필드만 고정이면 됨)
-      await ensureIdentity();
+      const { ok, status, data } = await postJson(settings.endpointUrl, msg.payload);
 
-      const { ok, status, text } = await postJson(
-        settings.endpointUrl,
-        msg.payload
-      );
-
-      sendResponse({ ok, status, text });
+      // 핵심: inject.js가 그대로 쓰게 서버 응답 JSON을 data로 전달
+      sendResponse({ ok, status, data });
     } catch (e) {
       console.log("[sentinel] sw error:", e);
       sendResponse({ ok: false, error: String(e?.message || e) });

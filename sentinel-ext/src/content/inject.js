@@ -3,7 +3,7 @@ console.log("[sentinel] inject loaded", location.href);
 
 (() => {
   // -------------------------
-  // Storage Keys (고정)
+  // Storage keys (SW와 반드시 동일)
   // -------------------------
   const STORAGE_KEYS = {
     enabled: "sentinel_enabled",
@@ -11,8 +11,6 @@ console.log("[sentinel] inject loaded", location.href);
     pcName: "sentinel_pc_name",
     uuid: "sentinel_uuid",
   };
-
-  const DEFAULT_ENDPOINT = "https://bobsentinel.com/api/logs";
 
   function storageGet(keys) {
     return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -48,15 +46,14 @@ console.log("[sentinel] inject loaded", location.href);
       [STORAGE_KEYS.pcName]: pcName,
     });
 
-    console.log("[sentinel] identity created:", pcName);
     return { pcName };
   }
 
   async function getSettings() {
     const got = await storageGet([STORAGE_KEYS.enabled, STORAGE_KEYS.endpointUrl]);
     return {
-      enabled: got[STORAGE_KEYS.enabled] !== false, // 기본 ON
-      endpointUrl: got[STORAGE_KEYS.endpointUrl] || DEFAULT_ENDPOINT,
+      enabled: got[STORAGE_KEYS.enabled] !== false, // default ON
+      endpointUrl: got[STORAGE_KEYS.endpointUrl] || "https://bobsentinel.com/api/logs",
     };
   }
 
@@ -86,15 +83,11 @@ console.log("[sentinel] inject loaded", location.href);
     return `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}.${micro}`;
   }
 
-  // -------------------------
-  // Payload schema
-  // public_ip/private_ip: PCName 그대로
-  // -------------------------
   function buildLogPayload({ host, pcName, prompt }) {
     return {
       time: nowKstIsoMicro(),
-      public_ip: pcName,
-      private_ip: pcName,
+      public_ip: pcName,   // 요구사항: PCName 그대로
+      private_ip: pcName,  // 요구사항: PCName 그대로
       host: host || "",
       PCName: pcName,
       prompt: String(prompt || ""),
@@ -113,39 +106,21 @@ console.log("[sentinel] inject loaded", location.href);
     return location.hostname || "";
   }
 
-  async function sendPrompt(prompt) {
-    console.log("[sentinel] sendPrompt called:", String(prompt).slice(0, 80));
-
-    const settings = await getSettings();
-    if (!settings.enabled) {
-      console.log("[sentinel] disabled => skip");
-      return;
-    }
-
-    const { pcName } = await ensureIdentity();
-    const payload = buildLogPayload({ host: getHost(), pcName, prompt });
-
-    chrome.runtime.sendMessage({ type: "SENTINEL_LOG", payload }, (resp) => {
-      const err = chrome.runtime.lastError;
-      if (err) console.log("[sentinel] sendMessage lastError:", err.message);
-      console.log("[sentinel] sendMessage resp:", resp);
-    });
-  }
-
-  // ✅ 콘솔 강제 테스트용 (collector 안 돼도 파이프라인 검증 가능)
-  window.__sentinelSend = (p) => sendPrompt(String(p || ""));
-  console.log("[sentinel] test: run __sentinelSend('hello') in console");
-
   // -------------------------
-  // ChatGPT collector (더 강하게)
+  // ChatGPT DOM helpers
   // -------------------------
+  const SELECTORS = [
+    "textarea#prompt-textarea",
+    "textarea",
+    "div[contenteditable='true'][role='textbox']",
+  ];
+
   function findInput() {
-    return (
-      document.querySelector("textarea#prompt-textarea") ||
-      document.querySelector("textarea") ||
-      document.querySelector("div[contenteditable='true'][role='textbox']") ||
-      document.querySelector("div[contenteditable='true']")
-    );
+    for (const sel of SELECTORS) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
   }
 
   function readValue(el) {
@@ -154,72 +129,220 @@ console.log("[sentinel] inject loaded", location.href);
     return el.textContent || "";
   }
 
-  function isSendButton(btn) {
-    if (!btn) return false;
-    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-    const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
-    const type = (btn.getAttribute("type") || "").toLowerCase();
-    const text = (btn.textContent || "").trim().toLowerCase();
-
-    // 영어/한글 케이스 둘 다
-    if (label.includes("send") || label.includes("보내")) return true;
-    if (testid.includes("send")) return true;
-    if (type === "submit") return true;
-    if (text === "send" || text.includes("보내")) return true;
-
-    return false;
+  function setValue(el, text) {
+    if (!el) return;
+    if (el.tagName === "TEXTAREA") {
+      el.value = text;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    } else {
+      el.textContent = text;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
   }
 
-  function attachChatGPTCollector(onPrompt) {
+  function findSendButton() {
+    // ChatGPT에서 흔히 보이는 selector들
+    return (
+      document.querySelector("button[data-testid='send-button']") ||
+      document.querySelector("button[aria-label*='Send']") ||
+      document.querySelector("button[aria-label*='send']") ||
+      null
+    );
+  }
+
+  function programmaticSend() {
+    // 버튼 클릭이 제일 안정적
+    const btn = findSendButton();
+    if (btn && !btn.disabled) {
+      btn.click();
+      return true;
+    }
+
+    // 버튼 못 찾으면 Enter 이벤트를 강제로 한 번 쏴보기(차선)
+    const el = findInput();
+    if (!el) return false;
+
+    const evt = new KeyboardEvent("keydown", {
+      key: "Enter",
+      code: "Enter",
+      bubbles: true,
+      cancelable: true,
+    });
+    el.dispatchEvent(evt);
+    return true;
+  }
+
+  // -------------------------
+  // Hold & Replace flow
+  // -------------------------
+  let bypassOnce = false;      // 우리가 programmaticSend 할 때 무한루프 방지
+  let inFlight = false;        // 중복 전송 방지(연타 방어)
+  let lastBlockedAt = 0;
+
+  async function processAndSend(rawPrompt, inputEl) {
+    const settings = await getSettings();
+
+    // 확장 OFF면 그냥 원래대로 보내기(홀딩하지 않음)
+    if (!settings.enabled) return { mode: "passthrough" };
+
+    if (inFlight) {
+      console.log("[sentinel] inFlight => skip");
+      return { mode: "skip" };
+    }
+    inFlight = true;
+
+    try {
+      const { pcName } = await ensureIdentity();
+      const payload = buildLogPayload({
+        host: getHost(),
+        pcName,
+        prompt: rawPrompt,
+      });
+
+      console.log("[sentinel] hold => send to SW", payload);
+
+      const resp = await new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+          { type: "SENTINEL_PROCESS", payload },
+          (r) => resolve(r || null)
+        );
+      });
+
+      // 네트워크 실패/응답 이상이면 fail-open: 원문 그대로 보내주기
+      if (!resp || resp.ok !== true || !resp.data) {
+        console.log("[sentinel] server fail => fail-open", resp);
+        bypassOnce = true;
+        setValue(inputEl, rawPrompt);
+        // 짧게 딜레이 주고 전송
+        setTimeout(() => {
+          programmaticSend();
+          bypassOnce = false;
+        }, 0);
+        return { mode: "fail-open" };
+      }
+
+      const data = resp.data; // 서버 응답 JSON
+      console.log("[sentinel] server resp:", data);
+
+      // allow=false면 차단(보내지 않음)
+      if (data.allow === false) {
+        const msg = data.alert || "차단되었습니다.";
+        // 너무 자주 alert 뜨는거 방지(연타시)
+        const now = Date.now();
+        if (now - lastBlockedAt > 800) window.alert(msg);
+        lastBlockedAt = now;
+
+        return { mode: "blocked", data };
+      }
+
+      const modified = String(data.modified_prompt ?? rawPrompt);
+
+      // 사용자 인지용 알림창
+      if (data.has_sensitive && data.alert) {
+        window.alert(data.alert);
+      }
+
+      // 입력창을 modified_prompt로 바꾸고, 그걸로 실제 전송
+      bypassOnce = true;
+      setValue(inputEl, modified);
+
+      setTimeout(() => {
+        programmaticSend();
+        bypassOnce = false;
+      }, 0);
+
+      return { mode: "masked", data };
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  // -------------------------
+  // Collector: Enter / Send click을 "가로채서" 홀딩
+  // -------------------------
+  function attachChatGPTCollector() {
     console.log("[sentinel] collector attach start");
 
-    // Enter 전송 감지 (document 캡처)
-    document.addEventListener(
-      "keydown",
-      (e) => {
-        if (e.key !== "Enter" || e.shiftKey) return;
-        const el = document.activeElement || findInput();
-        const raw = readValue(el);
-        const p = normalizePrompt(raw);
-        if (p) {
-          console.log("[sentinel] keydown enter captured");
-          onPrompt(p);
-        }
-      },
-      true
-    );
+    function hook(el) {
+      if (!el || el.__sentinelHooked) return;
+      el.__sentinelHooked = true;
 
-    // Send 버튼 클릭 감지 (document 캡처)
-    document.addEventListener(
-      "click",
-      (e) => {
-        const btn = e.target && e.target.closest ? e.target.closest("button") : null;
-        if (!isSendButton(btn)) return;
+      // Enter 전송 가로채기
+      el.addEventListener(
+        "keydown",
+        async (e) => {
+          // 우리가 programmaticSend 하는 순간은 그대로 통과
+          if (bypassOnce) return;
 
-        const el = findInput();
-        const raw = readValue(el);
-        const p = normalizePrompt(raw);
-        if (p) {
-          console.log("[sentinel] send button click captured");
-          onPrompt(p);
-        }
-      },
-      true
-    );
+          // IME 입력중엔 건드리면 사고남
+          if (e.isComposing) return;
 
-    // 디버그용: input 존재 확인 로그
+          // Enter(전송) / Shift+Enter(줄바꿈)
+          if (e.key === "Enter" && !e.shiftKey) {
+            const raw = normalizePrompt(readValue(el));
+            if (!raw) return;
+
+            console.log("[sentinel] keydown enter captured => HOLD");
+
+            // 기본 전송 막기 (핵심)
+            e.preventDefault();
+            e.stopPropagation();
+            if (typeof e.stopImmediatePropagation === "function") {
+              e.stopImmediatePropagation();
+            }
+
+            await processAndSend(raw, el);
+          }
+        },
+        true // capture
+      );
+
+      // Send 버튼 클릭도 가로채기
+      document.addEventListener(
+        "click",
+        async (e) => {
+          if (bypassOnce) return;
+
+          const btn = e.target?.closest?.("button");
+          if (!btn) return;
+
+          const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+          const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
+          const looksSend = label.includes("send") || testid.includes("send");
+
+          if (!looksSend) return;
+
+          const raw = normalizePrompt(readValue(el));
+          if (!raw) return;
+
+          console.log("[sentinel] send button click captured => HOLD");
+
+          // 기본 클릭 전송 막기
+          e.preventDefault();
+          e.stopPropagation();
+          if (typeof e.stopImmediatePropagation === "function") {
+            e.stopImmediatePropagation();
+          }
+
+          await processAndSend(raw, el);
+        },
+        true
+      );
+    }
+
     const mo = new MutationObserver(() => {
-      const el = findInput();
-      if (el && !el.__sentinelLogged) {
-        el.__sentinelLogged = true;
-        console.log("[sentinel] input found:", el.tagName, el.id || "", el.className || "");
+      const input = findInput();
+      if (input) {
+        console.log("[sentinel] input found:", input.tagName, input.id || input.className || "");
       }
+      hook(input);
     });
+
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
-    // 최초 확인
-    const first = findInput();
-    if (first) console.log("[sentinel] input found initially:", first.tagName, first.id || "");
+    const input = findInput();
+    if (input) console.log("[sentinel] input found initially:", input.tagName);
+    hook(input);
   }
 
   // -------------------------
@@ -227,12 +350,8 @@ console.log("[sentinel] inject loaded", location.href);
   // -------------------------
   (async () => {
     await ensureIdentity();
-
-    const handler = (raw) => {
-      const p = normalizePrompt(raw);
-      if (p) sendPrompt(p);
-    };
-
-    if (getHost() === "chatgpt.com") attachChatGPTCollector(handler);
+    if (getHost() === "chatgpt.com") {
+      attachChatGPTCollector();
+    }
   })();
 })();
