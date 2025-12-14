@@ -1,6 +1,7 @@
 // src/background/sw.js
-// ✅ inject.js와 동일한 STORAGE_KEYS/규칙으로 동작하는 Service Worker
+console.log("[sentinel] sw loaded");
 
+// inject.js와 동일 키
 const STORAGE_KEYS = {
   enabled: "sentinel_enabled",
   endpointUrl: "sentinel_endpoint_url",
@@ -8,11 +9,18 @@ const STORAGE_KEYS = {
   uuid: "sentinel_uuid",
 };
 
-function storageGet(keys) {
-  return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
-}
-function storageSet(obj) {
-  return new Promise((resolve) => chrome.storage.local.set(obj, resolve));
+const DEFAULT_ENDPOINT = "https://bobsentinel.com/api/logs";
+
+async function getSettings() {
+  const data = await chrome.storage.local.get([
+    STORAGE_KEYS.enabled,
+    STORAGE_KEYS.endpointUrl,
+  ]);
+
+  return {
+    enabled: data[STORAGE_KEYS.enabled] !== false, // default true
+    endpointUrl: data[STORAGE_KEYS.endpointUrl] || DEFAULT_ENDPOINT,
+  };
 }
 
 function uuidv4() {
@@ -22,44 +30,37 @@ function uuidv4() {
   buf[8] = (buf[8] & 0x3f) | 0x80;
   const hex = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
   return (
-    hex.slice(0, 8) +
-    "-" +
-    hex.slice(8, 12) +
-    "-" +
-    hex.slice(12, 16) +
-    "-" +
-    hex.slice(16, 20) +
-    "-" +
+    hex.slice(0, 8) + "-" +
+    hex.slice(8, 12) + "-" +
+    hex.slice(12, 16) + "-" +
+    hex.slice(16, 20) + "-" +
     hex.slice(20)
   );
 }
 
-// settings: enabled 기본 true, endpointUrl 기본값 제공 (inject.js와 동일)
-async function getSettings() {
-  const got = await storageGet([STORAGE_KEYS.enabled, STORAGE_KEYS.endpointUrl]);
-  return {
-    enabled: got[STORAGE_KEYS.enabled] !== false, // default true
-    endpointUrl: got[STORAGE_KEYS.endpointUrl] || "https://bobsentinel.com/api/logs",
-  };
-}
-
-// PCName 고정: "CE-" + uuid앞8자리 (inject.js와 동일 저장키/규칙)
+// PCName 고정: "CE-" + uuid앞8자리
 async function ensureIdentity() {
-  const got = await storageGet([STORAGE_KEYS.pcName, STORAGE_KEYS.uuid]);
-  if (got[STORAGE_KEYS.pcName]) return { pcName: got[STORAGE_KEYS.pcName] };
+  const data = await chrome.storage.local.get([
+    STORAGE_KEYS.pcName,
+    STORAGE_KEYS.uuid,
+  ]);
 
-  const u = got[STORAGE_KEYS.uuid] || uuidv4();
+  if (data[STORAGE_KEYS.pcName]) return { pcName: data[STORAGE_KEYS.pcName] };
+
+  const u = data[STORAGE_KEYS.uuid] || uuidv4();
   const pcName = "CE-" + String(u).replace(/-/g, "").slice(0, 8);
 
-  await storageSet({
+  await chrome.storage.local.set({
     [STORAGE_KEYS.uuid]: u,
     [STORAGE_KEYS.pcName]: pcName,
   });
 
+  console.log("[sentinel] identity created (sw):", pcName);
   return { pcName };
 }
 
 async function postJson(url, payload) {
+  console.log("[sentinel] POST ->", url);
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -67,40 +68,32 @@ async function postJson(url, payload) {
   });
 
   const text = await res.text().catch(() => "");
+  console.log("[sentinel] POST result:", res.status, text.slice(0, 200));
   return { ok: res.ok, status: res.status, text };
 }
 
-console.log("[sentinel] sw loaded");
-
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  console.log("[sentinel] onMessage:", msg?.type, "from", sender?.tab?.url);
-
   (async () => {
     try {
       if (!msg || msg.type !== "SENTINEL_LOG") return;
 
+      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
+
       const settings = await getSettings();
       if (!settings.enabled) {
-        console.log("[sentinel] skipped: disabled");
         sendResponse({ ok: true, skipped: true, reason: "disabled" });
         return;
       }
 
-      // PCName 고정 보장
       await ensureIdentity();
 
-      const endpointUrl = settings.endpointUrl || "https://bobsentinel.com/api/logs";
-      console.log("[sentinel] POST ->", endpointUrl);
-
-      const { ok, status, text } = await postJson(endpointUrl, msg.payload);
-      console.log("[sentinel] POST result:", { ok, status });
-
+      const { ok, status, text } = await postJson(settings.endpointUrl, msg.payload);
       sendResponse({ ok, status, text });
     } catch (e) {
-      console.error("[sentinel] sw error:", e);
+      console.log("[sentinel] sw error:", e);
       sendResponse({ ok: false, error: String(e?.message || e) });
     }
   })();
 
-  return true; // async
+  return true; // async response
 });

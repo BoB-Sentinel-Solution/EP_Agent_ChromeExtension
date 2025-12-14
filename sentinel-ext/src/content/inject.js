@@ -1,15 +1,18 @@
 // src/content/inject.js
 console.log("[sentinel] inject loaded", location.href);
+
 (() => {
   // -------------------------
-  // Settings / Identity (storage)
+  // Storage Keys (고정)
   // -------------------------
   const STORAGE_KEYS = {
     enabled: "sentinel_enabled",
     endpointUrl: "sentinel_endpoint_url",
     pcName: "sentinel_pc_name",
-    uuid: "sentinel_uuid"
+    uuid: "sentinel_uuid",
   };
+
+  const DEFAULT_ENDPOINT = "https://bobsentinel.com/api/logs";
 
   function storageGet(keys) {
     return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
@@ -42,9 +45,10 @@ console.log("[sentinel] inject loaded", location.href);
 
     await storageSet({
       [STORAGE_KEYS.uuid]: u,
-      [STORAGE_KEYS.pcName]: pcName
+      [STORAGE_KEYS.pcName]: pcName,
     });
 
+    console.log("[sentinel] identity created:", pcName);
     return { pcName };
   }
 
@@ -52,12 +56,12 @@ console.log("[sentinel] inject loaded", location.href);
     const got = await storageGet([STORAGE_KEYS.enabled, STORAGE_KEYS.endpointUrl]);
     return {
       enabled: got[STORAGE_KEYS.enabled] !== false, // 기본 ON
-      endpointUrl: got[STORAGE_KEYS.endpointUrl] || "https://bobsentinel.com/api/logs"
+      endpointUrl: got[STORAGE_KEYS.endpointUrl] || DEFAULT_ENDPOINT,
     };
   }
 
   // -------------------------
-  // KST time: YYYY-MM-DDTHH:mm:ss.SSSuuu (uuu는 랜덤 마이크로)
+  // KST time: YYYY-MM-DDTHH:mm:ss.SSSuuu
   // -------------------------
   function nowKstIsoMicro() {
     const dtf = new Intl.DateTimeFormat("en-CA", {
@@ -68,7 +72,7 @@ console.log("[sentinel] inject loaded", location.href);
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
-      hour12: false
+      hour12: false,
     });
 
     const parts = dtf.formatToParts(new Date());
@@ -76,7 +80,7 @@ console.log("[sentinel] inject loaded", location.href);
     for (const p of parts) map[p.type] = p.value;
 
     const ms = String(new Date().getMilliseconds()).padStart(3, "0");
-    const rand = String(Math.floor(Math.random() * 1000)).padStart(3, "0"); // 오탐/형식 고정용
+    const rand = String(Math.floor(Math.random() * 1000)).padStart(3, "0");
     const micro = ms + rand;
 
     return `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}.${micro}`;
@@ -84,7 +88,7 @@ console.log("[sentinel] inject loaded", location.href);
 
   // -------------------------
   // Payload schema
-  // - public_ip/private_ip: PCName 그대로 (요구사항)
+  // public_ip/private_ip: PCName 그대로
   // -------------------------
   function buildLogPayload({ host, pcName, prompt }) {
     return {
@@ -95,7 +99,7 @@ console.log("[sentinel] inject loaded", location.href);
       PCName: pcName,
       prompt: String(prompt || ""),
       attachment: { format: null, data: null },
-      interface: "llm"
+      interface: "llm",
     };
   }
 
@@ -110,99 +114,112 @@ console.log("[sentinel] inject loaded", location.href);
   }
 
   async function sendPrompt(prompt) {
+    console.log("[sentinel] sendPrompt called:", String(prompt).slice(0, 80));
+
     const settings = await getSettings();
-    if (!settings.enabled) return;
+    if (!settings.enabled) {
+      console.log("[sentinel] disabled => skip");
+      return;
+    }
 
     const { pcName } = await ensureIdentity();
+    const payload = buildLogPayload({ host: getHost(), pcName, prompt });
 
-    const payload = buildLogPayload({
-      host: getHost(),
-      pcName,
-      prompt
+    chrome.runtime.sendMessage({ type: "SENTINEL_LOG", payload }, (resp) => {
+      const err = chrome.runtime.lastError;
+      if (err) console.log("[sentinel] sendMessage lastError:", err.message);
+      console.log("[sentinel] sendMessage resp:", resp);
     });
-
-    chrome.runtime.sendMessage({ type: "SENTINEL_LOG", payload }, () => {});
   }
 
+  // ✅ 콘솔 강제 테스트용 (collector 안 돼도 파이프라인 검증 가능)
+  window.__sentinelSend = (p) => sendPrompt(String(p || ""));
+  console.log("[sentinel] test: run __sentinelSend('hello') in console");
+
   // -------------------------
-  // ChatGPT collector: Enter / Send 버튼 감지
+  // ChatGPT collector (더 강하게)
   // -------------------------
+  function findInput() {
+    return (
+      document.querySelector("textarea#prompt-textarea") ||
+      document.querySelector("textarea") ||
+      document.querySelector("div[contenteditable='true'][role='textbox']") ||
+      document.querySelector("div[contenteditable='true']")
+    );
+  }
+
+  function readValue(el) {
+    if (!el) return "";
+    if (el.tagName === "TEXTAREA") return el.value || "";
+    return el.textContent || "";
+  }
+
+  function isSendButton(btn) {
+    if (!btn) return false;
+    const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+    const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
+    const type = (btn.getAttribute("type") || "").toLowerCase();
+    const text = (btn.textContent || "").trim().toLowerCase();
+
+    // 영어/한글 케이스 둘 다
+    if (label.includes("send") || label.includes("보내")) return true;
+    if (testid.includes("send")) return true;
+    if (type === "submit") return true;
+    if (text === "send" || text.includes("보내")) return true;
+
+    return false;
+  }
+
   function attachChatGPTCollector(onPrompt) {
-    const SELECTORS = [
-      "textarea#prompt-textarea",
-      "textarea[data-id='root']",
-      "textarea",
-      "div[contenteditable='true'][role='textbox']"
-    ];
+    console.log("[sentinel] collector attach start");
 
-    function findInput() {
-      for (const sel of SELECTORS) {
-        const el = document.querySelector(sel);
-        if (el) return el;
-      }
-      return null;
-    }
-
-    function readValue(el) {
-      if (!el) return "";
-      if (el.tagName === "TEXTAREA") return el.value || "";
-      // contenteditable
-      return el.textContent || "";
-    }
-
-    function clearValue(el) {
-      if (!el) return;
-      if (el.tagName === "TEXTAREA") {
-        el.value = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      } else {
-        el.textContent = "";
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
-    }
-
-    function hook(el) {
-      if (!el || el.__sentinelHooked) return;
-      el.__sentinelHooked = true;
-
-      el.addEventListener("keydown", (e) => {
-        // Enter(전송) / Shift+Enter(줄바꿈)
-        if (e.key === "Enter" && !e.shiftKey) {
-          const raw = readValue(el);
-          const p = normalizePrompt(raw);
-          if (p) onPrompt(p);
+    // Enter 전송 감지 (document 캡처)
+    document.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.key !== "Enter" || e.shiftKey) return;
+        const el = document.activeElement || findInput();
+        const raw = readValue(el);
+        const p = normalizePrompt(raw);
+        if (p) {
+          console.log("[sentinel] keydown enter captured");
+          onPrompt(p);
         }
-      }, true);
+      },
+      true
+    );
 
-      // 버튼 클릭 전송도 대응(버튼은 DOM이 자주 바뀌어서 document 캡처)
-      document.addEventListener("click", (e) => {
-        const btn = e.target && e.target.closest && e.target.closest("button");
-        if (!btn) return;
+    // Send 버튼 클릭 감지 (document 캡처)
+    document.addEventListener(
+      "click",
+      (e) => {
+        const btn = e.target && e.target.closest ? e.target.closest("button") : null;
+        if (!isSendButton(btn)) return;
 
-        // “Send” 류 버튼 추정: aria-label / data-testid 등을 폭넓게 봄
-        const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-        const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
-        if (label.includes("send") || testid.includes("send")) {
-          const raw = readValue(el);
-          const p = normalizePrompt(raw);
-          if (p) onPrompt(p);
+        const el = findInput();
+        const raw = readValue(el);
+        const p = normalizePrompt(raw);
+        if (p) {
+          console.log("[sentinel] send button click captured");
+          onPrompt(p);
         }
-      }, true);
-    }
+      },
+      true
+    );
 
-    // 최초 + DOM 변경 대응
+    // 디버그용: input 존재 확인 로그
     const mo = new MutationObserver(() => {
-      const input = findInput();
-      hook(input);
+      const el = findInput();
+      if (el && !el.__sentinelLogged) {
+        el.__sentinelLogged = true;
+        console.log("[sentinel] input found:", el.tagName, el.id || "", el.className || "");
+      }
     });
     mo.observe(document.documentElement, { childList: true, subtree: true });
 
-    hook(findInput());
-  }
-
-  function attachGenericCollector(onPrompt) {
-    // fallback: 아무것도 안 함(필요하면 나중에 확장)
-    // 지금은 chatgpt.com만 matches라 사실상 미사용
+    // 최초 확인
+    const first = findInput();
+    if (first) console.log("[sentinel] input found initially:", first.tagName, first.id || "");
   }
 
   // -------------------------
@@ -210,13 +227,12 @@ console.log("[sentinel] inject loaded", location.href);
   // -------------------------
   (async () => {
     await ensureIdentity();
-    const host = getHost();
+
     const handler = (raw) => {
       const p = normalizePrompt(raw);
       if (p) sendPrompt(p);
     };
 
-    if (host === "chatgpt.com") attachChatGPTCollector(handler);
-    else attachGenericCollector(handler);
+    if (getHost() === "chatgpt.com") attachChatGPTCollector(handler);
   })();
 })();
