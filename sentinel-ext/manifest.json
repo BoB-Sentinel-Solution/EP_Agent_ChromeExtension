@@ -25,14 +25,39 @@
         "https://chat.openai.com/*",
 
         "https://gemini.google.com/*",
-        
+
         "https://claude.ai/*",
 
         "https://chat.deepseek.com/*",
         "https://deepseek.com/*",
 
         "https://groq.com/*",
-        "https://console.groq.com/*"
+        "https://console.groq.com/*",
+
+        
+        
+        "https://grok.com/*",
+
+        "https://www.perplexity.ai/*",
+        "https://perplexity.ai/*",
+
+        "https://poe.com/*",
+
+        "https://chat.mistral.ai/*",
+
+        "https://cohere.com/*",
+        "https://*.cohere.com/*",
+
+        "https://huggingface.co/chat/*",
+        "https://huggingface.co/chat",
+
+        "https://meta.ai/*",
+
+        "https://you.com/*",
+
+        "https://phind.com/*",
+
+        "https://openrouter.ai/*"
       ],
       "js": [
         "src/content/collectors/registry.js",
