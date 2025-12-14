@@ -1,7 +1,7 @@
 // src/background/sw.js
 console.log("[sentinel] sw loaded");
 
-// inject.js와 동일 키
+// ✅ inject.js와 동일 키
 const STORAGE_KEYS = {
   enabled: "sentinel_enabled",
   endpointUrl: "sentinel_endpoint_url",
@@ -28,6 +28,7 @@ function uuidv4() {
   crypto.getRandomValues(buf);
   buf[6] = (buf[6] & 0x0f) | 0x40;
   buf[8] = (buf[8] & 0x3f) | 0x80;
+
   const hex = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
   return (
     hex.slice(0, 8) + "-" +
@@ -38,14 +39,16 @@ function uuidv4() {
   );
 }
 
-// PCName 고정: "CE-" + uuid앞8자리
+// ✅ PCName 고정: "CE-" + uuid 앞 8자리 (inject.js와 동일 로직)
 async function ensureIdentity() {
   const data = await chrome.storage.local.get([
     STORAGE_KEYS.pcName,
     STORAGE_KEYS.uuid,
   ]);
 
-  if (data[STORAGE_KEYS.pcName]) return { pcName: data[STORAGE_KEYS.pcName] };
+  if (data[STORAGE_KEYS.pcName]) {
+    return { pcName: data[STORAGE_KEYS.pcName] };
+  }
 
   const u = data[STORAGE_KEYS.uuid] || uuidv4();
   const pcName = "CE-" + String(u).replace(/-/g, "").slice(0, 8);
@@ -61,11 +64,19 @@ async function ensureIdentity() {
 
 async function postJson(url, payload) {
   console.log("[sentinel] POST ->", url);
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+  console.log("[sentinel] payload ->", payload); // ✅ 최종 JSON 확인
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.log("[sentinel] fetch failed:", e);
+    throw e;
+  }
 
   const text = await res.text().catch(() => "");
   console.log("[sentinel] POST result:", res.status, text.slice(0, 200));
@@ -77,7 +88,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try {
       if (!msg || msg.type !== "SENTINEL_LOG") return;
 
-      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
+      console.log(
+        "[sentinel] onMessage:",
+        msg.type,
+        "from",
+        sender?.url || "unknown"
+      );
 
       const settings = await getSettings();
       if (!settings.enabled) {
@@ -85,9 +101,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
 
+      // ✅ PCName 저장 보장(필드만 고정이면 됨)
       await ensureIdentity();
 
-      const { ok, status, text } = await postJson(settings.endpointUrl, msg.payload);
+      const { ok, status, text } = await postJson(
+        settings.endpointUrl,
+        msg.payload
+      );
+
       sendResponse({ ok, status, text });
     } catch (e) {
       console.log("[sentinel] sw error:", e);
