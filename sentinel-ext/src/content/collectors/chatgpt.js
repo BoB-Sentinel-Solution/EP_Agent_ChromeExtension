@@ -1,79 +1,85 @@
 // src/content/collectors/chatgpt.js
-
-function findTextarea() {
-  // ChatGPT UI는 자주 바뀌어서 "일단 가장 가능성 높은 textarea"를 잡는 방식
-  const t = document.querySelector("textarea");
-  return t || null;
-}
-
-function findSendButton() {
-  // 버튼 후보: aria-label / data-testid 등 다양
-  const candidates = [
-    'button[aria-label*="Send"]',
-    'button[data-testid*="send"]',
-    'button[type="submit"]'
-  ];
-  for (const sel of candidates) {
-    const el = document.querySelector(sel);
-    if (el) return el;
-  }
-  return null;
-}
-
-export function attachChatGPTCollector(onPrompt) {
-  let lastSent = "";
-
-  function captureAndSend(from) {
-    const ta = findTextarea();
-    if (!ta) return;
-
-    const val = (ta.value || "").trim();
-    if (!val) return;
-
-    // 중복 전송 방지(연속 클릭/엔터)
-    if (val === lastSent) return;
-    lastSent = val;
-
-    onPrompt(val);
-
-    // 입력창은 ChatGPT가 처리하므로 여기서 지우진 않음
+(() => {
+  const REG = window.__SENTINEL_COLLECTORS;
+  if (!REG) {
+    console.warn("[sentinel] collectors registry not loaded");
+    return;
   }
 
-  // 1) Enter(Shift+Enter 제외)
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      const ta = findTextarea();
-      if (!ta) return;
-      if (document.activeElement !== ta) return;
+  function attach(ctx) {
+    const {
+      log,
+      findInput,
+      readValue,
+      normalizePrompt,
+      shouldBypass,
+      onHoldSend, // async (rawPrompt, inputEl) => void
+    } = ctx;
 
-      if (e.key === "Enter" && !e.shiftKey) {
-        // ChatGPT가 submit 처리하기 직전에 캡처
-        captureAndSend("enter");
-      }
-    },
-    true
-  );
+    log("[collector/chatgpt] attach start");
 
-  // 2) Send 버튼 클릭
-  document.addEventListener(
-    "click",
-    (e) => {
-      const btn = findSendButton();
-      if (!btn) return;
-      if (e.target === btn || (e.target && btn.contains(e.target))) {
-        captureAndSend("click");
-      }
-    },
-    true
-  );
+    // Enter 가로채기
+    document.addEventListener(
+      "keydown",
+      async (e) => {
+        if (shouldBypass()) return;
+        if (e.key !== "Enter" || e.shiftKey) return;
+        if (e.isComposing) return;
 
-  // 3) 폼 submit (혹시 있을 때)
-  document.addEventListener(
-    "submit",
-    (e) => {
-      captureAndSend("submit");
-    },
-    true
-  );
-}
+        const inputEl = findInput();
+        if (!inputEl) return;
+
+        const raw = normalizePrompt(readValue(inputEl));
+        if (!raw) return;
+
+        log("[collector/chatgpt] enter => HOLD");
+
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+
+        await onHoldSend(raw, inputEl);
+      },
+      true
+    );
+
+    // Send 버튼 클릭 가로채기
+    document.addEventListener(
+      "click",
+      async (e) => {
+        if (shouldBypass()) return;
+
+        const btn = e.target?.closest?.("button");
+        if (!btn) return;
+
+        const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+        const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
+
+        const looksSend = label.includes("send") || testid.includes("send");
+        if (!looksSend) return;
+
+        const inputEl = findInput();
+        if (!inputEl) return;
+
+        const raw = normalizePrompt(readValue(inputEl));
+        if (!raw) return;
+
+        log("[collector/chatgpt] click send => HOLD");
+
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+
+        await onHoldSend(raw, inputEl);
+      },
+      true
+    );
+  }
+
+  REG.register({
+    id: "chatgpt",
+    hosts: ["chatgpt.com"],
+    priority: 100,
+    attach,
+  });
+})();

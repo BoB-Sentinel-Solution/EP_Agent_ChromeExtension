@@ -108,7 +108,7 @@ console.log("[sentinel] inject loaded", location.href);
   }
 
   // -------------------------
-  // ChatGPT DOM helpers
+  // Generic DOM helpers (여러 LLM 서비스에서 재사용)
   // -------------------------
   const SELECTORS = [
     "textarea#prompt-textarea",
@@ -162,6 +162,7 @@ console.log("[sentinel] inject loaded", location.href);
     }
   }
 
+  // (프로그램 전송은 collector마다 다를 수 있어서 기본 구현은 남겨둠)
   function findSendButton() {
     return (
       document.querySelector("button[data-testid='send-button']") ||
@@ -281,87 +282,7 @@ console.log("[sentinel] inject loaded", location.href);
   }
 
   // -------------------------
-  // Collector (document 레벨 캡처로 안정화)
-  // -------------------------
-  function attachChatGPTCollector() {
-    console.log("[sentinel] collector attach start");
-
-    // 1) Enter 전송 가로채기
-    document.addEventListener(
-      "keydown",
-      async (e) => {
-        if (bypassOnce) return;
-
-        if (e.key !== "Enter" || e.shiftKey) return;
-
-        // 한글 IME 조합중 Enter는 무시(조합 확정용)
-        if (e.isComposing) {
-          console.log("[sentinel] Enter ignored (isComposing=true)");
-          return;
-        }
-
-        const inputEl = findInput();
-        if (!inputEl) return;
-
-        const raw = normalizePrompt(readValue(inputEl));
-        if (!raw) return;
-
-        console.log("[sentinel] keydown enter captured => HOLD");
-
-        e.preventDefault();
-        e.stopPropagation();
-        if (typeof e.stopImmediatePropagation === "function") {
-          e.stopImmediatePropagation();
-        }
-
-        await processAndSend(raw, inputEl);
-      },
-      true
-    );
-
-    // 2) Send 버튼 클릭 가로채기
-    document.addEventListener(
-      "click",
-      async (e) => {
-        if (bypassOnce) return;
-
-        const btn = e.target?.closest?.("button");
-        if (!btn) return;
-
-        const label = (btn.getAttribute("aria-label") || "").toLowerCase();
-        const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
-        const type = (btn.getAttribute("type") || "").toLowerCase();
-
-        const looksSend =
-          label.includes("send") ||
-          testid.includes("send") ||
-          type === "submit";
-
-        if (!looksSend) return;
-
-        const inputEl = findInput();
-        if (!inputEl) return;
-
-        const raw = normalizePrompt(readValue(inputEl));
-        if (!raw) return;
-
-        console.log("[sentinel] send button click captured => HOLD");
-
-        e.preventDefault();
-        e.stopPropagation();
-        if (typeof e.stopImmediatePropagation === "function") {
-          e.stopImmediatePropagation();
-        }
-
-        await processAndSend(raw, inputEl);
-      },
-      true
-    );
-  }
-
-  // -------------------------
-  // 수동 테스트용 함수
-  // 콘솔에서: window.__sentinelSend("hello")
+  // Manual test
   // -------------------------
   window.__sentinelSend = async (text) => {
     const inputEl = findInput();
@@ -376,14 +297,46 @@ console.log("[sentinel] inject loaded", location.href);
   };
 
   // -------------------------
-  // boot
+  // boot (collector registry가 attach 담당)
   // -------------------------
   (async () => {
     await ensureIdentity();
-    if (getHost() === "chatgpt.com") {
-      const input = findInput();
-      if (input) console.log("[sentinel] input found initially:", input.tagName, input.id || input.className || "");
-      attachChatGPTCollector();
+
+    const host = getHost();
+
+    // registry.js가 window.__SENTINEL_COLLECTORS 제공
+    const REG = window.__SENTINEL_COLLECTORS;
+    if (!REG || typeof REG.pick !== "function") {
+      console.log("[sentinel] collector registry missing. (check manifest load order)");
+      return;
     }
+
+    const picked = REG.pick(host);
+    if (!picked || typeof picked.attach !== "function") {
+      console.log("[sentinel] no collector found for host:", host);
+      return;
+    }
+
+    console.log("[sentinel] picked collector:", picked.id || "(no id)");
+
+    picked.attach({
+      // logger
+      log: (...args) => console.log("[sentinel]", ...args),
+
+      // dom helpers 제공
+      findInput,
+      readValue,
+      setValue,
+
+      // prompt helpers
+      normalizePrompt,
+
+      // state helpers
+      shouldBypass: () => bypassOnce,
+      isComposingEvent: (e) => !!e?.isComposing,
+
+      // 핵심: hold 처리 진입점
+      onHoldSend: processAndSend,
+    });
   })();
 })();

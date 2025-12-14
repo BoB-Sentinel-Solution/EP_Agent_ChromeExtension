@@ -1,37 +1,87 @@
 // src/content/collectors/generic.js
+(() => {
+  const REG = window.__SENTINEL_COLLECTORS;
+  if (!REG) return;
 
-export function attachGenericCollector(onPrompt) {
-  let lastSent = "";
+  function attach(ctx) {
+    const {
+      log,
+      findInput,
+      readValue,
+      normalizePrompt,
+      shouldBypass,
+      onHoldSend,
+    } = ctx;
 
-  function activeInputValue() {
-    const el = document.activeElement;
-    if (!el) return null;
+    log("[collector/generic] attach start");
 
-    // textarea or text input
-    if (el.tagName === "TEXTAREA") return el.value;
-    if (el.tagName === "INPUT") {
-      const t = (el.getAttribute("type") || "text").toLowerCase();
-      if (t === "text" || t === "search") return el.value;
-    }
-    return null;
+    document.addEventListener(
+      "keydown",
+      async (e) => {
+        if (shouldBypass()) return;
+        if (e.key !== "Enter" || e.shiftKey) return;
+        if (e.isComposing) return;
+
+        const inputEl = findInput();
+        if (!inputEl) return;
+
+        const raw = normalizePrompt(readValue(inputEl));
+        if (!raw) return;
+
+        log("[collector/generic] enter => HOLD");
+
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+
+        await onHoldSend(raw, inputEl);
+      },
+      true
+    );
+
+    document.addEventListener(
+      "click",
+      async (e) => {
+        if (shouldBypass()) return;
+
+        const btn = e.target?.closest?.("button, input[type='submit']");
+        if (!btn) return;
+
+        const label = (btn.getAttribute?.("aria-label") || "").toLowerCase();
+        const type = (btn.getAttribute?.("type") || "").toLowerCase();
+        const testid = (btn.getAttribute?.("data-testid") || "").toLowerCase();
+
+        // send/submit 류 추정
+        const looksSend =
+          label.includes("send") ||
+          label.includes("submit") ||
+          testid.includes("send") ||
+          type === "submit";
+
+        if (!looksSend) return;
+
+        const inputEl = findInput();
+        if (!inputEl) return;
+
+        const raw = normalizePrompt(readValue(inputEl));
+        if (!raw) return;
+
+        log("[collector/generic] click => HOLD");
+
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+
+        await onHoldSend(raw, inputEl);
+      },
+      true
+    );
   }
 
-  function maybeSend(reason) {
-    const raw = activeInputValue();
-    const val = String(raw ?? "").trim();
-    if (!val) return;
-    if (val === lastSent) return;
-    lastSent = val;
-    onPrompt(val);
-  }
-
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
-        maybeSend("enter");
-      }
-    },
-    true
-  );
-}
+  REG.register({
+    id: "generic",
+    hosts: [], // pick에서 기본 fallback으로 사용
+    priority: -1,
+    attach,
+  });
+})();

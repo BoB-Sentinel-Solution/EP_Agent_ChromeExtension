@@ -5,22 +5,32 @@
   "description": "Send LLM prompt logs to Sentinel Server using fixed JSON schema.",
   "permissions": ["storage"],
   "host_permissions": ["<all_urls>"],
+
   "background": {
     "service_worker": "src/background/sw.js",
     "type": "module"
   },
+
   "action": {
     "default_title": "Sentinel",
     "default_popup": "src/ui/popup.html"
   },
+
   "options_page": "src/ui/options.html",
+
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*"],
-      "js": ["src/content/inject.js"],
+      "js": [
+        "src/content/collectors/registry.js",
+        "src/content/collectors/chatgpt.js",
+        "src/content/collectors/generic.js",
+        "src/content/inject.js"
+      ],
       "run_at": "document_idle"
     }
   ],
+
   "icons": {
     "16": "assets/icon16.png",
     "48": "assets/icon48.png",
