@@ -1,155 +1,222 @@
 // src/content/inject.js
-// ✅ content script는 ESM(import) 불가 → 단일 파일로 구성
 
-function getHost() {
-  return location.hostname || "";
-}
-
-// --- KST ISO (microseconds 6 digits) ---
-function nowKstIsoMicro() {
-  const d = new Date();
-
-  // KST로 변환: UTC 기준 ms + 9시간
-  const utcMs = d.getTime() + d.getTimezoneOffset() * 60 * 1000;
-  const kst = new Date(utcMs + 9 * 60 * 60 * 1000);
-
-  const pad2 = (n) => String(n).padStart(2, "0");
-  const pad3 = (n) => String(n).padStart(3, "0");
-
-  const yyyy = kst.getFullYear();
-  const MM = pad2(kst.getMonth() + 1);
-  const dd = pad2(kst.getDate());
-  const hh = pad2(kst.getHours());
-  const mm = pad2(kst.getMinutes());
-  const ss = pad2(kst.getSeconds());
-  const ms = pad3(kst.getMilliseconds());
-
-  // microseconds 6자리 요구 → ms(3) + "000"
-  return `${yyyy}-${MM}-${dd}T${hh}:${mm}:${ss}.${ms}000`;
-}
-
-// --- settings ---
-async function getSettings() {
-  const data = await chrome.storage.local.get(["enabled", "endpointUrl"]);
-  return {
-    enabled: data.enabled !== false,
-    endpointUrl: data.endpointUrl || "https://bobsentinel.com/api/logs",
+(() => {
+  // -------------------------
+  // Settings / Identity (storage)
+  // -------------------------
+  const STORAGE_KEYS = {
+    enabled: "sentinel_enabled",
+    endpointUrl: "sentinel_endpoint_url",
+    pcName: "sentinel_pc_name",
+    uuid: "sentinel_uuid"
   };
-}
 
-// --- identity (PCName 고정) ---
-async function ensureIdentity() {
-  const key = "PCName";
-  const data = await chrome.storage.local.get([key]);
-  if (data[key]) return { pcName: data[key] };
+  function storageGet(keys) {
+    return new Promise((resolve) => chrome.storage.local.get(keys, resolve));
+  }
+  function storageSet(obj) {
+    return new Promise((resolve) => chrome.storage.local.set(obj, resolve));
+  }
 
-  const uuid = crypto.randomUUID();
-  const pcName = "CE-" + uuid.slice(0, 8);
-  await chrome.storage.local.set({ [key]: pcName });
-  return { pcName };
-}
+  function uuidv4() {
+    const buf = new Uint8Array(16);
+    crypto.getRandomValues(buf);
+    buf[6] = (buf[6] & 0x0f) | 0x40;
+    buf[8] = (buf[8] & 0x3f) | 0x80;
+    const hex = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
+    return (
+      hex.slice(0, 8) + "-" +
+      hex.slice(8, 12) + "-" +
+      hex.slice(12, 16) + "-" +
+      hex.slice(16, 20) + "-" +
+      hex.slice(20)
+    );
+  }
 
-// --- schema builder (서버 규격 고정) ---
-function buildLogPayload({ host, pcName, prompt }) {
-  return {
-    time: nowKstIsoMicro(),
-    public_ip: pcName,   // ✅ 오탐 방지: IP처럼 보이는 값 금지 → PCName으로 대체
-    private_ip: pcName,  // ✅ 동일 규칙
-    host: host,
-    PCName: pcName,
-    prompt: prompt,
-    attachment: { format: null, data: null },
-    interface: "llm",
-  };
-}
+  async function ensureIdentity() {
+    const got = await storageGet([STORAGE_KEYS.pcName, STORAGE_KEYS.uuid]);
+    if (got[STORAGE_KEYS.pcName]) return { pcName: got[STORAGE_KEYS.pcName] };
 
-function normalizePrompt(s) {
-  const v = String(s ?? "").trim();
-  if (!v) return null;
-  return v.length > 20000 ? v.slice(0, 20000) : v;
-}
+    const u = got[STORAGE_KEYS.uuid] || uuidv4();
+    const pcName = "CE-" + String(u).replace(/-/g, "").slice(0, 8);
 
-async function sendPrompt(rawPrompt) {
-  const settings = await getSettings();
-  if (!settings.enabled) return;
+    await storageSet({
+      [STORAGE_KEYS.uuid]: u,
+      [STORAGE_KEYS.pcName]: pcName
+    });
 
-  const p = normalizePrompt(rawPrompt);
-  if (!p) return;
+    return { pcName };
+  }
 
-  const { pcName } = await ensureIdentity();
-  const payload = buildLogPayload({
-    host: getHost(),
-    pcName,
-    prompt: p,
-  });
+  async function getSettings() {
+    const got = await storageGet([STORAGE_KEYS.enabled, STORAGE_KEYS.endpointUrl]);
+    return {
+      enabled: got[STORAGE_KEYS.enabled] !== false, // 기본 ON
+      endpointUrl: got[STORAGE_KEYS.endpointUrl] || "https://bobsentinel.com/api/logs"
+    };
+  }
 
-  chrome.runtime.sendMessage({ type: "SENTINEL_LOG", payload });
-}
+  // -------------------------
+  // KST time: YYYY-MM-DDTHH:mm:ss.SSSuuu (uuu는 랜덤 마이크로)
+  // -------------------------
+  function nowKstIsoMicro() {
+    const dtf = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Seoul",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
 
-// --- ChatGPT collector: Enter(전송) / Send 버튼 클릭 감지 ---
-function attachChatGPTCollector(onPrompt) {
-  const getTextarea = () =>
-    document.querySelector("#prompt-textarea") ||
-    document.querySelector("textarea");
+    const parts = dtf.formatToParts(new Date());
+    const map = {};
+    for (const p of parts) map[p.type] = p.value;
 
-  // Enter 전송 감지
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      const ta = getTextarea();
-      if (!ta) return;
-      if (e.target !== ta) return;
+    const ms = String(new Date().getMilliseconds()).padStart(3, "0");
+    const rand = String(Math.floor(Math.random() * 1000)).padStart(3, "0"); // 오탐/형식 고정용
+    const micro = ms + rand;
 
-      // 조합중/Shift+Enter 제외
-      if (e.isComposing) return;
-      if (e.key === "Enter" && !e.shiftKey) {
-        const value = ta.value;
-        if (value && value.trim()) onPrompt(value);
+    return `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}.${micro}`;
+  }
+
+  // -------------------------
+  // Payload schema
+  // - public_ip/private_ip: PCName 그대로 (요구사항)
+  // -------------------------
+  function buildLogPayload({ host, pcName, prompt }) {
+    return {
+      time: nowKstIsoMicro(),
+      public_ip: pcName,
+      private_ip: pcName,
+      host: host || "",
+      PCName: pcName,
+      prompt: String(prompt || ""),
+      attachment: { format: null, data: null },
+      interface: "llm"
+    };
+  }
+
+  function normalizePrompt(s) {
+    const v = String(s ?? "").trim();
+    if (!v) return null;
+    return v.length > 20000 ? v.slice(0, 20000) : v;
+  }
+
+  function getHost() {
+    return location.hostname || "";
+  }
+
+  async function sendPrompt(prompt) {
+    const settings = await getSettings();
+    if (!settings.enabled) return;
+
+    const { pcName } = await ensureIdentity();
+
+    const payload = buildLogPayload({
+      host: getHost(),
+      pcName,
+      prompt
+    });
+
+    chrome.runtime.sendMessage({ type: "SENTINEL_LOG", payload }, () => {});
+  }
+
+  // -------------------------
+  // ChatGPT collector: Enter / Send 버튼 감지
+  // -------------------------
+  function attachChatGPTCollector(onPrompt) {
+    const SELECTORS = [
+      "textarea#prompt-textarea",
+      "textarea[data-id='root']",
+      "textarea",
+      "div[contenteditable='true'][role='textbox']"
+    ];
+
+    function findInput() {
+      for (const sel of SELECTORS) {
+        const el = document.querySelector(sel);
+        if (el) return el;
       }
-    },
-    true
-  );
+      return null;
+    }
 
-  // Send 버튼 클릭 감지
-  document.addEventListener(
-    "click",
-    (e) => {
-      const btn = e.target?.closest?.('button[data-testid="send-button"]');
-      if (!btn) return;
+    function readValue(el) {
+      if (!el) return "";
+      if (el.tagName === "TEXTAREA") return el.value || "";
+      // contenteditable
+      return el.textContent || "";
+    }
 
-      const ta = getTextarea();
-      const value = ta?.value;
-      if (value && value.trim()) onPrompt(value);
-    },
-    true
-  );
-}
-
-// --- fallback (다른 사이트 대비) ---
-function attachGenericCollector(onPrompt) {
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      const t = e.target;
-      const isTextArea = t && t.tagName === "TEXTAREA";
-      if (!isTextArea) return;
-      if (e.isComposing) return;
-      if (e.key === "Enter" && !e.shiftKey) {
-        const value = t.value;
-        if (value && value.trim()) onPrompt(value);
+    function clearValue(el) {
+      if (!el) return;
+      if (el.tagName === "TEXTAREA") {
+        el.value = "";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      } else {
+        el.textContent = "";
+        el.dispatchEvent(new Event("input", { bubbles: true }));
       }
-    },
-    true
-  );
-}
+    }
 
-// --- boot ---
-(async () => {
-  await ensureIdentity();
+    function hook(el) {
+      if (!el || el.__sentinelHooked) return;
+      el.__sentinelHooked = true;
 
-  const host = getHost();
-  const handler = (p) => sendPrompt(p);
+      el.addEventListener("keydown", (e) => {
+        // Enter(전송) / Shift+Enter(줄바꿈)
+        if (e.key === "Enter" && !e.shiftKey) {
+          const raw = readValue(el);
+          const p = normalizePrompt(raw);
+          if (p) onPrompt(p);
+        }
+      }, true);
 
-  if (host === "chatgpt.com") attachChatGPTCollector(handler);
-  else attachGenericCollector(handler);
+      // 버튼 클릭 전송도 대응(버튼은 DOM이 자주 바뀌어서 document 캡처)
+      document.addEventListener("click", (e) => {
+        const btn = e.target && e.target.closest && e.target.closest("button");
+        if (!btn) return;
+
+        // “Send” 류 버튼 추정: aria-label / data-testid 등을 폭넓게 봄
+        const label = (btn.getAttribute("aria-label") || "").toLowerCase();
+        const testid = (btn.getAttribute("data-testid") || "").toLowerCase();
+        if (label.includes("send") || testid.includes("send")) {
+          const raw = readValue(el);
+          const p = normalizePrompt(raw);
+          if (p) onPrompt(p);
+        }
+      }, true);
+    }
+
+    // 최초 + DOM 변경 대응
+    const mo = new MutationObserver(() => {
+      const input = findInput();
+      hook(input);
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+
+    hook(findInput());
+  }
+
+  function attachGenericCollector(onPrompt) {
+    // fallback: 아무것도 안 함(필요하면 나중에 확장)
+    // 지금은 chatgpt.com만 matches라 사실상 미사용
+  }
+
+  // -------------------------
+  // boot
+  // -------------------------
+  (async () => {
+    await ensureIdentity();
+    const host = getHost();
+    const handler = (raw) => {
+      const p = normalizePrompt(raw);
+      if (p) sendPrompt(p);
+    };
+
+    if (host === "chatgpt.com") attachChatGPTCollector(handler);
+    else attachGenericCollector(handler);
+  })();
 })();
