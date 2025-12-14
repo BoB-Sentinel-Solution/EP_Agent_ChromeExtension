@@ -20,7 +20,20 @@
 
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+
+        "https://gemini.google.com/*",
+        
+        "https://claude.ai/*",
+
+        "https://chat.deepseek.com/*",
+        "https://deepseek.com/*",
+
+        "https://groq.com/*",
+        "https://console.groq.com/*"
+      ],
       "js": [
         "src/content/collectors/registry.js",
         "src/content/collectors/chatgpt.js",
