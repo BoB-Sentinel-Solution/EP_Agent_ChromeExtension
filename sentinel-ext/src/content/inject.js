@@ -1,5 +1,5 @@
 // src/content/inject.js
-
+console.log("[sentinel] inject loaded", location.href);
 (() => {
   // -------------------------
   // Settings / Identity (storage)
