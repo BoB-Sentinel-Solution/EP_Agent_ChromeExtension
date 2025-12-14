@@ -55,10 +55,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (!msg) return;
-
       if (msg.type !== "SENTINEL_PROCESS") return;
 
-      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
+      console.log(
+        "[sentinel] onMessage:",
+        msg.type,
+        "from",
+        sender?.url || "unknown"
+      );
 
       const settings = await getSettings();
       if (!settings.enabled) {
@@ -68,7 +72,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       const { ok, status, data } = await postJson(settings.endpointUrl, msg.payload);
 
-      // 핵심: inject.js가 그대로 쓰게 서버 응답 JSON을 data로 전달
+      // inject.js가 그대로 쓰게 서버 응답 JSON을 data로 전달
       sendResponse({ ok, status, data });
     } catch (e) {
       console.log("[sentinel] sw error:", e);
