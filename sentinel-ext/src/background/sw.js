@@ -10,7 +10,7 @@ const STORAGE_KEYS = {
 };
 
 const DEFAULT_ENDPOINT = "https://bobsentinel.com/api/logs";
-const FETCH_TIMEOUT_MS = 10_000; // ✅ 10초 타임아웃
+const FETCH_TIMEOUT_MS = 10_000;
 
 async function getSettings() {
   const data = await chrome.storage.local.get([
@@ -37,23 +37,13 @@ async function postJson(url, payload) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-      signal: controller.signal, // ✅ 타임아웃 제어
+      signal: controller.signal,
     });
   } catch (e) {
-    clearTimeout(timer);
-
-    // ✅ 타임아웃(Abort)
-    if (e && (e.name === "AbortError" || String(e).includes("AbortError"))) {
-      console.log("[sentinel] fetch timeout:", FETCH_TIMEOUT_MS, "ms");
-      return {
-        ok: false,
-        status: 0,
-        text: "",
-        data: null,
-        error: "timeout",
-      };
+    if (e && e.name === "AbortError") {
+      console.log("[sentinel] fetch timeout after", FETCH_TIMEOUT_MS, "ms");
+      throw new Error("timeout");
     }
-
     console.log("[sentinel] fetch failed:", e);
     throw e;
   } finally {
@@ -69,7 +59,7 @@ async function postJson(url, payload) {
   }
 
   console.log("[sentinel] POST result:", res.status, (text || "").slice(0, 200));
-  return { ok: res.ok, status: res.status, text, data, error: null };
+  return { ok: res.ok, status: res.status, text, data };
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -78,12 +68,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!msg) return;
       if (msg.type !== "SENTINEL_PROCESS") return;
 
-      console.log(
-        "[sentinel] onMessage:",
-        msg.type,
-        "from",
-        sender?.url || "unknown"
-      );
+      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
 
       const settings = await getSettings();
       if (!settings.enabled) {
@@ -91,16 +76,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
 
-      const result = await postJson(settings.endpointUrl, msg.payload);
+      const { ok, status, data } = await postJson(settings.endpointUrl, msg.payload);
 
       // inject.js가 그대로 쓰게 서버 응답 JSON을 data로 전달
-      // timeout이면 ok:false,error:"timeout" 으로 돌아감 -> inject.js에서 fail-open 처리됨
-      sendResponse({
-        ok: result.ok,
-        status: result.status,
-        data: result.data,
-        error: result.error || null,
-      });
+      sendResponse({ ok, status, data });
     } catch (e) {
       console.log("[sentinel] sw error:", e);
       sendResponse({ ok: false, error: String(e?.message || e) });
