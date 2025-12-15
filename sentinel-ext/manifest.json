@@ -7,6 +7,7 @@
 
   "host_permissions": [
     "https://bobsentinel.com/*",
+    "https://bobsentinel.site/*",
 
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
