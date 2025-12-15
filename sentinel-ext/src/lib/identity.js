@@ -10,18 +10,18 @@ function makePcNameFromUuid(uuid) {
 export async function ensureIdentity() {
   const s = await getSettings();
 
-  let deviceId = s.deviceId;
-  if (!deviceId) {
-    deviceId = crypto.randomUUID();
+  let uuid = s.uuid;
+  if (!uuid) {
+    uuid = crypto.randomUUID();
   }
 
   let pcName = s.pcName;
   if (!pcName) {
-    pcName = makePcNameFromUuid(deviceId);
+    pcName = makePcNameFromUuid(uuid);
   }
 
   // PCName은 한 PC에서 항상 동일하게 유지
-  await setSettings({ deviceId, pcName });
+  await setSettings({ uuid, pcName });
 
-  return { deviceId, pcName };
+  return { uuid, pcName };
 }
