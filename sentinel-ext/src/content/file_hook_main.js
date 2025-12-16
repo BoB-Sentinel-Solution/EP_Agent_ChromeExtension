@@ -73,6 +73,25 @@
     return out;
   }
 
+  // ✅ Request 객체로 들어온 업로드를 처리 (Gemini에서 자주 나오는 패턴)
+  function tryHandleRequestBodyAsFormData(req) {
+    try {
+      // Body는 한번 읽으면 소모되므로 clone() 사용
+      if (!(req instanceof Request)) return null;
+      const method = String(req.method || "GET").toUpperCase();
+      if (method === "GET" || method === "HEAD") return null;
+
+      // formData()는 multipart/form-data / urlencoded 등에만 의미가 있음
+      return req
+        .clone()
+        .formData()
+        .then((fd) => ({ ok: true, fd }))
+        .catch(() => null);
+    } catch {
+      return null;
+    }
+  }
+
   // -------------------------
   // fetch wrapper
   // -------------------------
@@ -125,6 +144,39 @@
         });
       }
 
+      // ✅ (추가) fetch(new Request(...)) 패턴 대응
+      // init.body가 없고 input이 Request면, Request의 body를 formData()로 꺼내서 검사
+      if (!body && input instanceof Request) {
+        const p = tryHandleRequestBodyAsFormData(input);
+        if (p) {
+          return p.then((r) => {
+            if (!r || !r.ok || !(r.fd instanceof FormData)) return _fetch.apply(this, arguments);
+
+            const hit = findFirstFileInFormData(r.fd);
+            if (!hit) return _fetch.apply(this, arguments);
+
+            console.log("[sentinel] fetch(Request) upload detected:", hit.file?.name, hit.file?.size);
+
+            return waitFileDecision(hit.file).then((decision) => {
+              if (decision.allow === false) {
+                console.log("[sentinel] fetch(Request) upload BLOCKED by policy");
+                throw new Error("blocked_by_policy");
+              }
+
+              if (decision.file_change && decision.newFile instanceof File) {
+                const newFd = replaceFirstFileInFormData(r.fd, decision.newFile);
+                // Request를 새로 만들어 body 교체
+                const newReq = new Request(input, { body: newFd });
+                console.log("[sentinel] fetch(Request) upload REPLACED:", decision.newFile.name, decision.newFile.size);
+                return _fetch.call(this, newReq);
+              }
+
+              return _fetch.apply(this, arguments);
+            });
+          });
+        }
+      }
+
       return _fetch.apply(this, arguments);
     } catch (e) {
       throw e;
@@ -156,25 +208,27 @@
 
         console.log("[sentinel] XHR upload detected:", hit.file?.name, hit.file?.size);
 
-        waitFileDecision(hit.file).then((decision) => {
-          if (decision.allow === false) {
-            console.log("[sentinel] XHR upload BLOCKED by policy");
-            try { this.abort(); } catch {}
-            return;
-          }
+        waitFileDecision(hit.file)
+          .then((decision) => {
+            if (decision.allow === false) {
+              console.log("[sentinel] XHR upload BLOCKED by policy");
+              try { this.abort(); } catch {}
+              return;
+            }
 
-          if (decision.file_change && decision.newFile instanceof File) {
-            const newBody = replaceFirstFileInFormData(body, decision.newFile);
-            console.log("[sentinel] XHR upload REPLACED:", decision.newFile.name, decision.newFile.size);
-            _send.call(this, newBody);
-            return;
-          }
+            if (decision.file_change && decision.newFile instanceof File) {
+              const newBody = replaceFirstFileInFormData(body, decision.newFile);
+              console.log("[sentinel] XHR upload REPLACED:", decision.newFile.name, decision.newFile.size);
+              _send.call(this, newBody);
+              return;
+            }
 
-          _send.apply(this, arguments);
-        }).catch((e) => {
-          console.log("[sentinel] XHR decision error => fail-open", e);
-          try { _send.apply(this, arguments); } catch {}
-        });
+            _send.apply(this, arguments);
+          })
+          .catch((e) => {
+            console.log("[sentinel] XHR decision error => fail-open", e);
+            try { _send.apply(this, arguments); } catch {}
+          });
 
         // send는 원래 void -> 여기서도 즉시 리턴
         return;
@@ -184,23 +238,25 @@
       if (body instanceof File) {
         console.log("[sentinel] XHR file detected:", body.name, body.size);
 
-        waitFileDecision(body).then((decision) => {
-          if (decision.allow === false) {
-            try { this.abort(); } catch {}
-            return;
-          }
+        waitFileDecision(body)
+          .then((decision) => {
+            if (decision.allow === false) {
+              try { this.abort(); } catch {}
+              return;
+            }
 
-          if (decision.file_change && decision.newFile instanceof File) {
-            console.log("[sentinel] XHR file REPLACED:", decision.newFile.name, decision.newFile.size);
-            _send.call(this, decision.newFile);
-            return;
-          }
+            if (decision.file_change && decision.newFile instanceof File) {
+              console.log("[sentinel] XHR file REPLACED:", decision.newFile.name, decision.newFile.size);
+              _send.call(this, decision.newFile);
+              return;
+            }
 
-          _send.apply(this, arguments);
-        }).catch((e) => {
-          console.log("[sentinel] XHR decision error => fail-open", e);
-          try { _send.apply(this, arguments); } catch {}
-        });
+            _send.apply(this, arguments);
+          })
+          .catch((e) => {
+            console.log("[sentinel] XHR decision error => fail-open", e);
+            try { _send.apply(this, arguments); } catch {}
+          });
 
         return;
       }
