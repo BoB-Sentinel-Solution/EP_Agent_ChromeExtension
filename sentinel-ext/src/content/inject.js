@@ -3,7 +3,28 @@ console.log("[sentinel] inject loaded", location.href);
 
 (() => {
   // -------------------------
-  // Storage keys (SW와 반드시 동일) 
+  // ✅ MAIN world fetch-hook 주입 (최소 추가)
+  // -------------------------
+  function injectMainHookOnce() {
+    try {
+      if (window.__SENTINEL_MAIN_HOOK_INJECTED__) return;
+      window.__SENTINEL_MAIN_HOOK_INJECTED__ = true;
+
+      const s = document.createElement("script");
+      s.src = chrome.runtime.getURL("src/content/file_hook_main.js"); // ✅ web_accessible_resources에 등록된 경로
+      s.async = false;
+      s.dataset.sentinel = "1";
+      (document.documentElement || document.head).appendChild(s);
+
+      console.log("[sentinel] main hook injected:", s.src);
+    } catch (e) {
+      console.log("[sentinel] main hook inject failed:", e);
+    }
+  }
+  injectMainHookOnce();
+
+  // -------------------------
+  // Storage keys (SW와 반드시 동일)
   // -------------------------
   const STORAGE_KEYS = {
     enabled: "sentinel_enabled",
@@ -26,10 +47,14 @@ console.log("[sentinel] inject loaded", location.href);
     buf[8] = (buf[8] & 0x3f) | 0x80;
     const hex = [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
     return (
-      hex.slice(0, 8) + "-" +
-      hex.slice(8, 12) + "-" +
-      hex.slice(12, 16) + "-" +
-      hex.slice(16, 20) + "-" +
+      hex.slice(0, 8) +
+      "-" +
+      hex.slice(8, 12) +
+      "-" +
+      hex.slice(12, 16) +
+      "-" +
+      hex.slice(16, 20) +
+      "-" +
       hex.slice(20)
     );
   }
@@ -87,12 +112,13 @@ console.log("[sentinel] inject loaded", location.href);
   function buildLogPayload({ host, pcName, prompt }) {
     return {
       time: nowKstIsoMicro(),
-      public_ip: pcName,   // 요구사항: PCName 그대로
-      private_ip: pcName,  // 요구사항: PCName 그대로
+      public_ip: pcName, // 요구사항: PCName 그대로
+      private_ip: pcName, // 요구사항: PCName 그대로
       host: host || "",
       PCName: pcName,
       prompt: String(prompt || ""),
-      attachment: { format: null, data: null },
+      // ✅ 최소 수정: size 포함 (file_hook가 채우거나, 없으면 null 유지)
+      attachment: { format: null, data: null, size: null },
       interface: "llm",
     };
   }
@@ -108,7 +134,7 @@ console.log("[sentinel] inject loaded", location.href);
   }
 
   // -------------------------
-  // Generic DOM helpers (여러 LLM 서비스에서 재사용)
+  // Generic DOM helpers
   // -------------------------
   const SELECTORS = [
     "textarea#prompt-textarea",
@@ -120,24 +146,26 @@ console.log("[sentinel] inject loaded", location.href);
     if (!el) return false;
     if (el.disabled) return false;
 
-    // 숨겨진/0크기 요소는 제외
     const rect = el.getBoundingClientRect?.();
     if (rect && (rect.width < 10 || rect.height < 10)) return false;
 
     const style = window.getComputedStyle?.(el);
-    if (style && (style.display === "none" || style.visibility === "hidden")) return false;
+    if (style && (style.display === "none" || style.visibility === "hidden"))
+      return false;
 
     return true;
   }
 
   function findInput() {
-    // 1) activeElement 우선
     const ae = document.activeElement;
-    if (ae && (ae.tagName === "TEXTAREA" || ae.isContentEditable) && isUsableInput(ae)) {
+    if (
+      ae &&
+      (ae.tagName === "TEXTAREA" || ae.isContentEditable) &&
+      isUsableInput(ae)
+    ) {
       return ae;
     }
 
-    // 2) selector 기반 탐색
     for (const sel of SELECTORS) {
       const el = document.querySelector(sel);
       if (el && isUsableInput(el)) return el;
@@ -162,7 +190,6 @@ console.log("[sentinel] inject loaded", location.href);
     }
   }
 
-  // (프로그램 전송은 collector마다 다를 수 있어서 기본 구현은 남겨둠)
   function findSendButton() {
     return (
       document.querySelector("button[data-testid='send-button']") ||
@@ -180,7 +207,6 @@ console.log("[sentinel] inject loaded", location.href);
       return true;
     }
 
-    // fallback
     const el = findInput();
     if (!el) return false;
 
@@ -197,8 +223,8 @@ console.log("[sentinel] inject loaded", location.href);
   // -------------------------
   // Hold & Replace flow
   // -------------------------
-  let bypassOnce = false; // 우리가 programmaticSend 할 때 무한루프 방지
-  let inFlight = false;   // 중복 전송 방지
+  let bypassOnce = false;
+  let inFlight = false;
   let lastAlertAt = 0;
 
   function safeAlert(msg) {
@@ -211,10 +237,13 @@ console.log("[sentinel] inject loaded", location.href);
   async function processAndSend(rawPrompt, inputEl) {
     const settings = await getSettings();
 
-    // ✅ enabled 상태 로깅
-    console.log("[sentinel] enabled =", settings.enabled, "| endpoint =", settings.endpointUrl);
+    console.log(
+      "[sentinel] enabled =",
+      settings.enabled,
+      "| endpoint =",
+      settings.endpointUrl
+    );
 
-    // ✅ 확장 OFF면: 서버 호출/홀딩 없이 원문 그대로 즉시 전송(collector가 막은 전송 복원)
     if (!settings.enabled) {
       console.log("[sentinel] passthrough (disabled) => send original");
       bypassOnce = true;
@@ -242,7 +271,6 @@ console.log("[sentinel] inject loaded", location.href);
 
       console.log("[sentinel] HOLD => send to SW", payload);
 
-      // SW에게 “서버 처리 요청”
       const resp = await new Promise((resolve) => {
         chrome.runtime.sendMessage(
           { type: "SENTINEL_PROCESS", payload },
@@ -250,7 +278,6 @@ console.log("[sentinel] inject loaded", location.href);
         );
       });
 
-      // fail-open: 서버/네트워크 실패면 원문 그대로 전송
       if (!resp || resp.ok !== true || !resp.data) {
         console.log("[sentinel] server fail => fail-open", resp);
         bypassOnce = true;
@@ -265,7 +292,6 @@ console.log("[sentinel] inject loaded", location.href);
       const data = resp.data;
       console.log("[sentinel] server resp:", data);
 
-      // allow=false면 차단(전송 안 함, 입력 유지)
       if (data.allow === false) {
         safeAlert("관리자 정책에 의해 차단되었습니다.");
         return { mode: "blocked", data };
@@ -273,12 +299,10 @@ console.log("[sentinel] inject loaded", location.href);
 
       const modified = String(data.modified_prompt ?? rawPrompt);
 
-      // 사용자 인지용(서버 alert)
       if (data.has_sensitive && data.alert) {
         safeAlert(data.alert);
       }
 
-      // 입력창을 modified_prompt로 바꾸고 전송
       bypassOnce = true;
       setValue(inputEl, modified);
 
@@ -309,14 +333,13 @@ console.log("[sentinel] inject loaded", location.href);
   };
 
   // -------------------------
-  // boot (collector registry가 attach 담당)
+  // boot
   // -------------------------
   (async () => {
     await ensureIdentity();
 
     const host = getHost();
 
-    // registry.js가 window.__SENTINEL_COLLECTORS 제공
     const REG = window.__SENTINEL_COLLECTORS;
     if (!REG || typeof REG.pick !== "function") {
       console.log("[sentinel] collector registry missing. (check manifest load order)");
@@ -332,22 +355,17 @@ console.log("[sentinel] inject loaded", location.href);
     console.log("[sentinel] picked collector:", picked.id || "(no id)");
 
     picked.attach({
-      // logger
       log: (...args) => console.log("[sentinel]", ...args),
 
-      // dom helpers 제공
       findInput,
       readValue,
       setValue,
 
-      // prompt helpers
       normalizePrompt,
 
-      // state helpers
       shouldBypass: () => bypassOnce,
       isComposingEvent: (e) => !!e?.isComposing,
 
-      // 핵심: hold 처리 진입점
       onHoldSend: processAndSend,
     });
   })();
