@@ -80,9 +80,7 @@
 
   "web_accessible_resources": [
     {
-      "resources": [
-        "src/content/file_hook_main.js"
-      ],
+      "resources": ["src/content/file_hook_main.js"],
       "matches": [
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
@@ -90,7 +88,6 @@
         "https://claude.ai/*",
         "https://chat.deepseek.com/*",
         "https://deepseek.com/*",
-        "https://chat.deepseek.com/*",
         "https://groq.com/*",
         "https://console.groq.com/*",
         "https://grok.com/*",
