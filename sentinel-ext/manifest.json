@@ -24,7 +24,7 @@
     "https://chat.mistral.ai/*",
     "https://cohere.com/*",
     "https://*.cohere.com/*",
-    "https://huggingface.co/chat/*",
+    "https://huggingface.co/*",
     "https://meta.ai/*",
     "https://you.com/*",
     "https://phind.com/*",
@@ -61,7 +61,7 @@
         "https://chat.mistral.ai/*",
         "https://cohere.com/*",
         "https://*.cohere.com/*",
-        "https://huggingface.co/chat/*",
+        "https://huggingface.co/*",
         "https://meta.ai/*",
         "https://you.com/*",
         "https://openrouter.ai/*"

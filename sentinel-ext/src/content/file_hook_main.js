@@ -12,6 +12,112 @@
 
   let seq = 0;
 
+  // -------------------------
+  // input[type=file] change fallback (Gemini 대응)
+  //  - 사용자가 선택한 File을 미리 기록해두고
+  //  - 네트워크 업로드 시점에 같은 파일이면 그 결과를 재사용
+  // -------------------------
+  const PENDING_TTL_MS = 60_000; // 60초 내 업로드면 같은 파일로 취급
+  const pending = new Map(); // key -> { ts, file, promise }
+
+  function now() {
+    return Date.now();
+  }
+
+  function fileKey(f) {
+    // File의 대표 signature (대부분 업로드 시 같은 객체거나 동일 signature로 재등장)
+    const name = String(f?.name || "");
+    const size = Number(f?.size || 0);
+    const type = String(f?.type || "");
+    const lm = Number(f?.lastModified || 0);
+    return `${name}|${size}|${type}|${lm}`;
+  }
+
+  function purgePending() {
+    const t = now();
+    for (const [k, v] of pending.entries()) {
+      if (!v || (t - v.ts) > PENDING_TTL_MS) pending.delete(k);
+    }
+  }
+
+  function putPending(file) {
+    try {
+      if (!(file instanceof File)) return;
+      purgePending();
+
+      const k = fileKey(file);
+      if (pending.has(k)) return;
+
+      // 미리 판정 시작 (네트워크 시점에서 재사용)
+      const p = waitFileDecision(file).catch((e) => {
+        console.log("[sentinel] pending decision error => fail-open", e);
+        return { allow: true, fail_open: true, reason: "pending_error" };
+      });
+
+      pending.set(k, { ts: now(), file, promise: p });
+      console.log("[sentinel] file change captured => pending set:", file.name, file.size);
+    } catch {}
+  }
+
+  function getPendingDecisionForFile(file) {
+    try {
+      if (!(file instanceof File)) return null;
+      purgePending();
+      const k = fileKey(file);
+      const hit = pending.get(k);
+      if (!hit) return null;
+      return hit.promise || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function getPendingDecisionForBlob(blob) {
+    // Blob은 name이 없을 수 있으니 (Gemini 케이스)
+    // size/type 기반으로 최근 pending 중 가장 가까운 것을 매칭
+    try {
+      if (!(blob instanceof Blob)) return null;
+      purgePending();
+
+      const bSize = Number(blob.size || 0);
+      const bType = String(blob.type || "");
+      const t = now();
+
+      for (const v of pending.values()) {
+        if (!v || !v.file) continue;
+        const age = t - v.ts;
+        if (age > PENDING_TTL_MS) continue;
+
+        // size/type가 같으면 일단 후보로 인정
+        if (Number(v.file.size || 0) === bSize && String(v.file.type || "") === bType) {
+          return v.promise || null;
+        }
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  // capturing 단계에서 file input change 훅
+  window.addEventListener(
+    "change",
+    (e) => {
+      try {
+        const el = e?.target;
+        if (!el) return;
+        if (el.tagName !== "INPUT") return;
+        if (String(el.type || "").toLowerCase() !== "file") return;
+
+        const files = el.files;
+        if (!files || !files.length) return;
+
+        for (const f of files) putPending(f);
+      } catch {}
+    },
+    true
+  );
+
   function waitFileDecision(file, timeoutMs = 15000) {
     const id = `${Date.now()}-${++seq}`;
 
@@ -49,22 +155,31 @@
     });
   }
 
-  function findFirstFileInFormData(fd) {
+  // -------------------------
+  // FormData helpers
+  //  - File 뿐 아니라 Blob도 탐지/교체
+  // -------------------------
+  function isFileLike(v) {
+    // "File/Blob" 모두 포함
+    return v instanceof File || v instanceof Blob;
+  }
+
+  function findFirstFileLikeInFormData(fd) {
     try {
       for (const [key, val] of fd.entries()) {
-        if (val instanceof File) return { key, file: val };
+        if (isFileLike(val)) return { key, value: val };
       }
     } catch {}
     return null;
   }
 
-  function replaceFirstFileInFormData(fd, newFile) {
-    const hit = findFirstFileInFormData(fd);
+  function replaceFirstFileLikeInFormData(fd, newFile) {
+    const hit = findFirstFileLikeInFormData(fd);
     if (!hit) return fd;
 
     const out = new FormData();
     for (const [k, v] of fd.entries()) {
-      if (k === hit.key && v instanceof File) {
+      if (k === hit.key && isFileLike(v)) {
         out.append(k, newFile, newFile.name);
       } else {
         out.append(k, v);
@@ -101,21 +216,29 @@
     try {
       const body = init && init.body;
 
-      // FormData에 File이 있으면 사전검사
+      // FormData에 File/Blob이 있으면 사전검사
       if (body instanceof FormData) {
-        const hit = findFirstFileInFormData(body);
+        const hit = findFirstFileLikeInFormData(body);
         if (!hit) return _fetch.apply(this, arguments);
 
-        console.log("[sentinel] fetch upload detected:", hit.file?.name, hit.file?.size);
+        const v = hit.value;
+        console.log("[sentinel] fetch upload detected:", v?.name || "(blob)", v?.size);
 
-        return waitFileDecision(hit.file).then((decision) => {
+        // ✅ pending 우선
+        const pendingP =
+          (v instanceof File ? getPendingDecisionForFile(v) : null) ||
+          (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
+
+        const decisionP = pendingP || waitFileDecision(v);
+
+        return decisionP.then((decision) => {
           if (decision.allow === false) {
             console.log("[sentinel] fetch upload BLOCKED by policy");
             throw new Error("blocked_by_policy");
           }
 
           if (decision.file_change && decision.newFile instanceof File) {
-            const newBody = replaceFirstFileInFormData(body, decision.newFile);
+            const newBody = replaceFirstFileLikeInFormData(body, decision.newFile);
             const newInit = { ...(init || {}), body: newBody };
             console.log("[sentinel] fetch upload REPLACED:", decision.newFile.name, decision.newFile.size);
             return _fetch.call(this, input, newInit);
@@ -125,18 +248,25 @@
         });
       }
 
-      // 단일 File 업로드
-      if (body instanceof File) {
-        console.log("[sentinel] fetch file detected:", body.name, body.size);
+      // 단일 File/Blob 업로드
+      if (isFileLike(body)) {
+        console.log("[sentinel] fetch file/blob detected:", body?.name || "(blob)", body?.size);
 
-        return waitFileDecision(body).then((decision) => {
+        // ✅ pending 우선
+        const pendingP =
+          (body instanceof File ? getPendingDecisionForFile(body) : null) ||
+          (body instanceof Blob ? getPendingDecisionForBlob(body) : null);
+
+        const decisionP = pendingP || waitFileDecision(body);
+
+        return decisionP.then((decision) => {
           if (decision.allow === false) {
             throw new Error("blocked_by_policy");
           }
 
           if (decision.file_change && decision.newFile instanceof File) {
             const newInit = { ...(init || {}), body: decision.newFile };
-            console.log("[sentinel] fetch file REPLACED:", decision.newFile.name, decision.newFile.size);
+            console.log("[sentinel] fetch file/blob REPLACED:", decision.newFile.name, decision.newFile.size);
             return _fetch.call(this, input, newInit);
           }
 
@@ -152,19 +282,27 @@
           return p.then((r) => {
             if (!r || !r.ok || !(r.fd instanceof FormData)) return _fetch.apply(this, arguments);
 
-            const hit = findFirstFileInFormData(r.fd);
+            const hit = findFirstFileLikeInFormData(r.fd);
             if (!hit) return _fetch.apply(this, arguments);
 
-            console.log("[sentinel] fetch(Request) upload detected:", hit.file?.name, hit.file?.size);
+            const v = hit.value;
+            console.log("[sentinel] fetch(Request) upload detected:", v?.name || "(blob)", v?.size);
 
-            return waitFileDecision(hit.file).then((decision) => {
+            // ✅ pending 우선
+            const pendingP =
+              (v instanceof File ? getPendingDecisionForFile(v) : null) ||
+              (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
+
+            const decisionP = pendingP || waitFileDecision(v);
+
+            return decisionP.then((decision) => {
               if (decision.allow === false) {
                 console.log("[sentinel] fetch(Request) upload BLOCKED by policy");
                 throw new Error("blocked_by_policy");
               }
 
               if (decision.file_change && decision.newFile instanceof File) {
-                const newFd = replaceFirstFileInFormData(r.fd, decision.newFile);
+                const newFd = replaceFirstFileLikeInFormData(r.fd, decision.newFile);
                 // Request를 새로 만들어 body 교체
                 const newReq = new Request(input, { body: newFd });
                 console.log("[sentinel] fetch(Request) upload REPLACED:", decision.newFile.name, decision.newFile.size);
@@ -203,12 +341,20 @@
     try {
       // FormData
       if (body instanceof FormData) {
-        const hit = findFirstFileInFormData(body);
+        const hit = findFirstFileLikeInFormData(body);
         if (!hit) return _send.apply(this, arguments);
 
-        console.log("[sentinel] XHR upload detected:", hit.file?.name, hit.file?.size);
+        const v = hit.value;
+        console.log("[sentinel] XHR upload detected:", v?.name || "(blob)", v?.size);
 
-        waitFileDecision(hit.file)
+        // ✅ pending 우선
+        const pendingP =
+          (v instanceof File ? getPendingDecisionForFile(v) : null) ||
+          (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
+
+        const decisionP = pendingP || waitFileDecision(v);
+
+        decisionP
           .then((decision) => {
             if (decision.allow === false) {
               console.log("[sentinel] XHR upload BLOCKED by policy");
@@ -217,7 +363,7 @@
             }
 
             if (decision.file_change && decision.newFile instanceof File) {
-              const newBody = replaceFirstFileInFormData(body, decision.newFile);
+              const newBody = replaceFirstFileLikeInFormData(body, decision.newFile);
               console.log("[sentinel] XHR upload REPLACED:", decision.newFile.name, decision.newFile.size);
               _send.call(this, newBody);
               return;
@@ -234,11 +380,18 @@
         return;
       }
 
-      // 단일 File
-      if (body instanceof File) {
-        console.log("[sentinel] XHR file detected:", body.name, body.size);
+      // 단일 File/Blob
+      if (isFileLike(body)) {
+        console.log("[sentinel] XHR file/blob detected:", body?.name || "(blob)", body?.size);
 
-        waitFileDecision(body)
+        // ✅ pending 우선
+        const pendingP =
+          (body instanceof File ? getPendingDecisionForFile(body) : null) ||
+          (body instanceof Blob ? getPendingDecisionForBlob(body) : null);
+
+        const decisionP = pendingP || waitFileDecision(body);
+
+        decisionP
           .then((decision) => {
             if (decision.allow === false) {
               try { this.abort(); } catch {}
@@ -246,7 +399,7 @@
             }
 
             if (decision.file_change && decision.newFile instanceof File) {
-              console.log("[sentinel] XHR file REPLACED:", decision.newFile.name, decision.newFile.size);
+              console.log("[sentinel] XHR file/blob REPLACED:", decision.newFile.name, decision.newFile.size);
               _send.call(this, decision.newFile);
               return;
             }
