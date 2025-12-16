@@ -1,157 +1,167 @@
 // src/content/file_hook.js
-// Sentinel CE Agent — File hook (single-file only, allowed extensions only)
-// Hook point: <input type="file"> change (capture phase)
-
 (() => {
-  "use strict";
+  const SENTINEL_FLAG = "__sentinel";
+  const REQ_TYPE = "SENTINEL_REDACT_FILE";
+  const RES_TYPE = "SENTINEL_REDACT_FILE_RESULT";
 
-  // ✅ Only these extensions are processed; everything else is ignored.
-  const ALLOWED = new Set([
-    "png", "jpg", "jpeg", "webp",
-    "pdf", "docx", "pptx", "csv", "txt", "xlsx",
-  ]);
+  // inject.js와 동일 키 유지
+  const STORAGE_KEYS = {
+    enabled: "sentinel_enabled",
+    endpointUrl: "sentinel_endpoint_url",
+    pcName: "sentinel_pc_name",
+    uuid: "sentinel_uuid",
+  };
 
-  function getExt(name = "") {
-    const i = name.lastIndexOf(".");
-    if (i < 0) return "";
-    return name.slice(i + 1).toLowerCase();
+  const DEFAULT_ENDPOINT = "https://bobsentinel.com/api/logs";
+
+  async function getSettings() {
+    const data = await chrome.storage.local.get([
+      STORAGE_KEYS.enabled,
+      STORAGE_KEYS.endpointUrl,
+      STORAGE_KEYS.pcName,
+      STORAGE_KEYS.uuid,
+    ]);
+
+    return {
+      enabled: data[STORAGE_KEYS.enabled] !== false,
+      endpointUrl: data[STORAGE_KEYS.endpointUrl] || DEFAULT_ENDPOINT,
+      pcName: data[STORAGE_KEYS.pcName] || "",
+      uuid: data[STORAGE_KEYS.uuid] || "",
+    };
   }
 
-  function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onerror = () => reject(new Error("FileReader failed"));
-      r.onload = () => {
-        const s = String(r.result || "");
-        // data:*/*;base64,XXXX
-        const idx = s.indexOf("base64,");
-        resolve(idx >= 0 ? s.slice(idx + 7) : "");
-      };
-      r.readAsDataURL(file);
+  function shouldBlockByServerResponse(serverJson) {
+    if (!serverJson) return false;
+    if (serverJson.allow === false) return true;
+    if (serverJson.file_blocked === true) return true;
+    if (serverJson.action && String(serverJson.action).toLowerCase().includes("block")) return true;
+    return false;
+  }
+
+  function extractReplaceAttachment(serverJson) {
+    const att = serverJson && serverJson.attachment;
+    if (!att) return null;
+    if (att.file_change !== true) return null;
+    if (!att.data || !att.format) return null;
+    return att;
+  }
+
+  async function callServerForFileRedact(payload) {
+    // SW로 위임 (CORS/토큰/timeout 한곳 관리)
+    const res = await chrome.runtime.sendMessage({
+      type: "SENTINEL_REDACT_FILE",
+      payload,
     });
+
+    // res: { ok, status, data }
+    return res;
   }
 
-  function guessMimeByExt(ext) {
-    const e = (ext || "").toLowerCase();
-    if (e === "png") return "image/png";
-    if (e === "jpg" || e === "jpeg") return "image/jpeg";
-    if (e === "webp") return "image/webp";
-    if (e === "pdf") return "application/pdf";
-    if (e === "docx")
-      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-    if (e === "pptx")
-      return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
-    if (e === "xlsx")
-      return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-    if (e === "csv") return "text/csv";
-    if (e === "txt") return "text/plain";
-    return "application/octet-stream";
-  }
+  window.addEventListener("message", (ev) => {
+    const msg = ev && ev.data;
+    if (!msg || msg[SENTINEL_FLAG] !== true) return;
+    if (msg.type !== REQ_TYPE) return;
 
-  function base64ToFile(b64, format, filename) {
-    // atob -> Uint8Array
-    const bin = atob(b64 || "");
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    (async () => {
+      const requestId = msg.request_id;
 
-    const mime = guessMimeByExt(format);
-    return new File([bytes], filename, { type: mime });
-  }
+      try {
+        const settings = await getSettings();
+        if (!settings.enabled) {
+          window.postMessage({
+            [SENTINEL_FLAG]: true,
+            type: RES_TYPE,
+            request_id: requestId,
+            ok: true,
+            block: false,
+            replace: false,
+          }, "*");
+          return;
+        }
 
-  async function replaceInputFile(input, newFile) {
-    const dt = new DataTransfer();
-    dt.items.add(newFile);
-    input.files = dt.files;
-
-    // loop guard (change/input will fire again)
-    input.dataset.sentinelBypass = "1";
-
-    // Many sites listen to both
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-
-    // release guard next tick
-    setTimeout(() => {
-      delete input.dataset.sentinelBypass;
-    }, 0);
-  }
-
-  function safeUUID() {
-    try {
-      if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
-        return globalThis.crypto.randomUUID();
-      }
-    } catch (_) {}
-    // fallback (not perfect, but ok for request_id uniqueness in practice)
-    return `req_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  }
-
-  document.addEventListener(
-    "change",
-    (e) => {
-      // fire-and-forget with internal try/catch
-      (async () => {
-        const t = e.target;
-        if (!(t instanceof HTMLInputElement)) return;
-        if (t.type !== "file") return;
-
-        // ignore internally-triggered re-dispatch
-        if (t.dataset.sentinelBypass === "1") return;
-
-        const files = t.files;
-        if (!files || files.length === 0) return;
-
-        // ✅ Policy: no arrays — if multiple selected, do nothing (pass-through)
-        if (files.length > 1) return;
-
-        const file = files[0];
-        const ext = getExt(file.name);
-
-        // ignore non-allowed extensions
-        if (!ALLOWED.has(ext)) return;
-
-        // encode
-        const b64 = await fileToBase64(file);
-
-        // build fixed schema (minimal fields here; sw.js can enrich as needed)
+        // 서버 스키마 "최소한" 맞추기 (기존대로 object 1개)
         const payload = {
-          request_id: safeUUID(),
-          host: location.host,
+          request_id: requestId,
+          time: new Date().toISOString(),
+          host: msg.host || location.host,
+          pc_name: settings.pcName,
+          uuid: settings.uuid,
+
+          // 파일 업로드 훅은 프롬프트를 모를 수 있음: 서버가 허용하면 됨
+          prompt: "",
+
           attachment: {
-            format: ext,
-            data: b64,
-            size: file.size, // bytes
+            format: msg.attachment.format,
+            data: msg.attachment.data,
+            size: msg.attachment.size,
           },
         };
 
-        // send to background -> server
-        const res = await chrome.runtime.sendMessage({
-          type: "SENTINEL_FILE_REDACT",
-          payload,
-        });
+        const { ok, data } = await callServerForFileRedact(payload);
 
-        if (!res || res.ok !== true) return;
-
-        const att = res.data?.attachment;
-        if (!att || att.file_change !== true) return;
-
-        // Server returns: { format, data, size, file_change:true }
-        const newExt = String(att.format || ext).toLowerCase();
-
-        // optional: keep original filename but align extension if server changed it
-        let newName = file.name;
-        if (getExt(newName) !== newExt) {
-          const dot = newName.lastIndexOf(".");
-          newName = (dot > 0 ? newName.slice(0, dot) : newName) + "." + newExt;
+        if (!ok) {
+          // fail-open
+          window.postMessage({
+            [SENTINEL_FLAG]: true,
+            type: RES_TYPE,
+            request_id: requestId,
+            ok: false,
+          }, "*");
+          return;
         }
 
-        // construct File from base64 and replace input
-        const newFile = base64ToFile(String(att.data || ""), newExt, newName);
-        await replaceInputFile(t, newFile);
-      })().catch(() => {
-        // swallow errors to avoid breaking page behavior
-      });
-    },
-    true // capture: reduce chance of missing early listeners
-  );
+        if (shouldBlockByServerResponse(data)) {
+          window.postMessage({
+            [SENTINEL_FLAG]: true,
+            type: RES_TYPE,
+            request_id: requestId,
+            ok: true,
+            block: true,
+            replace: false,
+          }, "*");
+          return;
+        }
+
+        const replaceAtt = extractReplaceAttachment(data);
+        if (replaceAtt) {
+          window.postMessage({
+            [SENTINEL_FLAG]: true,
+            type: RES_TYPE,
+            request_id: requestId,
+            ok: true,
+            block: false,
+            replace: true,
+            attachment: {
+              format: replaceAtt.format,
+              data: replaceAtt.data,
+              size: replaceAtt.size,
+              file_change: true,
+            },
+          }, "*");
+          return;
+        }
+
+        // 교체 없음
+        window.postMessage({
+          [SENTINEL_FLAG]: true,
+          type: RES_TYPE,
+          request_id: requestId,
+          ok: true,
+          block: false,
+          replace: false,
+        }, "*");
+      } catch (e) {
+        // fail-open
+        window.postMessage({
+          [SENTINEL_FLAG]: true,
+          type: RES_TYPE,
+          request_id: requestId,
+          ok: false,
+          error: String(e && e.message ? e.message : e),
+        }, "*");
+      }
+    })();
+  });
+
+  console.log("[sentinel] file_hook (isolated) loaded");
 })();
