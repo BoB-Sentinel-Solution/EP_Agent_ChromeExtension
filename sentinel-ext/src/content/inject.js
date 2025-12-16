@@ -211,8 +211,20 @@ console.log("[sentinel] inject loaded", location.href);
   async function processAndSend(rawPrompt, inputEl) {
     const settings = await getSettings();
 
-    // 확장 OFF면 홀딩하지 않음
-    if (!settings.enabled) return { mode: "passthrough" };
+    // ✅ enabled 상태 로깅
+    console.log("[sentinel] enabled =", settings.enabled, "| endpoint =", settings.endpointUrl);
+
+    // ✅ 확장 OFF면: 서버 호출/홀딩 없이 원문 그대로 즉시 전송(collector가 막은 전송 복원)
+    if (!settings.enabled) {
+      console.log("[sentinel] passthrough (disabled) => send original");
+      bypassOnce = true;
+      setValue(inputEl, rawPrompt);
+      setTimeout(() => {
+        programmaticSend();
+        bypassOnce = false;
+      }, 0);
+      return { mode: "passthrough" };
+    }
 
     if (inFlight) {
       console.log("[sentinel] inFlight => skip");
