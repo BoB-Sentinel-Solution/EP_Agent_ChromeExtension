@@ -72,6 +72,10 @@
         "src/content/collectors/chatgpt.js",
         "src/content/collectors/generic.js",
         "src/content/inject.js",
+
+        "src/content/utils/file_types.js",
+        "src/content/utils/file_codec.js",
+
         "src/content/file_hook.js"
       ],
       "run_at": "document_idle"

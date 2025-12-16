@@ -77,32 +77,48 @@ console.log("[sentinel] file_hook (isolated) loaded");
       private_ip: pcName,
       host: host || "",
       PCName: pcName,
-      // 파일 업로드 사전검사라 prompt는 비워둠(스키마 유지용)
-      prompt: "",
+      prompt: "", // 파일 사전검사라 prompt는 비움(스키마 유지)
       attachment: attachment || { format: null, data: null, size: 0 },
       interface: "llm",
     };
   }
 
-  // 1) MAIN world 스크립트 주입
+  // -------------------------
+  // 1) MAIN world 스크립트 주입 (중복 방지)
+  // -------------------------
   (function injectMainHook() {
-    const src = chrome.runtime.getURL("src/content/file_hook_main.js");
-    const s = document.createElement("script");
-    s.src = src;
-    s.async = false;
-    (document.head || document.documentElement).appendChild(s);
-    s.onload = () => {
-      s.remove();
-      console.log("[sentinel] main hook injected:", src);
-    };
-    s.onerror = () => {
-      console.log("[sentinel] main hook inject FAILED:", src);
-      s.remove();
-    };
+    try {
+      if (window.__SENTINEL_FILE_HOOK_MAIN_INJECTED) {
+        // 중복 주입 방지
+        return;
+      }
+      window.__SENTINEL_FILE_HOOK_MAIN_INJECTED = true;
+
+      const src = chrome.runtime.getURL("src/content/file_hook_main.js");
+      const s = document.createElement("script");
+      s.src = src;
+      s.async = false;
+      (document.head || document.documentElement).appendChild(s);
+
+      s.onload = () => {
+        s.remove();
+        console.log("[sentinel] main hook injected:", src);
+      };
+      s.onerror = () => {
+        console.log("[sentinel] main hook inject FAILED:", src);
+        s.remove();
+      };
+    } catch (e) {
+      console.log("[sentinel] main hook inject error:", e);
+    }
   })();
 
-  const FT = window.__SENTINEL_FILE_TYPES;
-  const FC = window.__SENTINEL_FILE_CODEC;
+  // 유틸 접근은 “처리 시점”에 가져오기 (undefined 방지)
+  function getUtils() {
+    const FT = window.__SENTINEL_FILE_TYPES;
+    const FC = window.__SENTINEL_FILE_CODEC;
+    return { FT, FC };
+  }
 
   window.addEventListener(
     "message",
@@ -115,23 +131,45 @@ console.log("[sentinel] file_hook (isolated) loaded");
       const file = msg.file;
 
       try {
-        // file이 없거나 File이 아니면 패스
-        if (!(file instanceof File)) {
-          window.postMessage({ type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "no_file" }, "*");
+        // utils 준비 안됐으면 fail-open
+        const { FT, FC } = getUtils();
+        if (!FT || !FC) {
+          console.log("[sentinel] file_hook: utils missing (FT/FC). fail-open");
+          window.postMessage(
+            { type: "SENTINEL_FILE_RESULT", id, allow: true, fail_open: true, reason: "utils_missing" },
+            "*"
+          );
           return;
         }
 
-        const fmt = FT.getFormatFromFileName(file.name);
+        // file이 없거나 File이 아니면 패스
+        if (!(file instanceof File)) {
+          window.postMessage(
+            { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "no_file" },
+            "*"
+          );
+          return;
+        }
+
+        const fileName = file.name || "upload.bin";
+        const fmt = FT.getFormatFromFileName(fileName);
+
         if (!FT.isSupportedFormat(fmt)) {
           // 요구사항: 지원 확장자만 서버로 전송, 나머지는 무시(통과)
-          window.postMessage({ type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "unsupported_format" }, "*");
+          window.postMessage(
+            { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "unsupported_format", format: fmt || null },
+            "*"
+          );
           return;
         }
 
         // File -> attachment(base64)
         const attachment = await FC.fileToAttachment(file);
-        if (!attachment) {
-          window.postMessage({ type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "codec_failed" }, "*");
+        if (!attachment || !attachment.data || !attachment.format) {
+          window.postMessage(
+            { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "codec_failed" },
+            "*"
+          );
           return;
         }
 
@@ -145,20 +183,20 @@ console.log("[sentinel] file_hook (isolated) loaded");
         console.log("[sentinel] file precheck => send to SW", {
           format: attachment.format,
           size: attachment.size,
-          name: file.name,
+          name: fileName,
         });
 
         const resp = await new Promise((resolve) => {
-          chrome.runtime.sendMessage(
-            { type: "SENTINEL_PROCESS", payload },
-            (r) => resolve(r || null)
-          );
+          chrome.runtime.sendMessage({ type: "SENTINEL_PROCESS", payload }, (r) => resolve(r || null));
         });
 
         // fail-open
         if (!resp || resp.ok !== true || !resp.data) {
           console.log("[sentinel] file precheck server fail => fail-open", resp);
-          window.postMessage({ type: "SENTINEL_FILE_RESULT", id, allow: true, fail_open: true }, "*");
+          window.postMessage(
+            { type: "SENTINEL_FILE_RESULT", id, allow: true, fail_open: true },
+            "*"
+          );
           return;
         }
 
@@ -176,7 +214,7 @@ console.log("[sentinel] file_hook (isolated) loaded");
         // 허용 + 파일 교체
         const att = data.attachment;
         if (att && att.file_change === true && att.data && att.format) {
-          const newFile = FC.attachmentToFile(att, file.name);
+          const newFile = FC.attachmentToFile(att, fileName);
           window.postMessage(
             { type: "SENTINEL_FILE_RESULT", id, allow: true, file_change: true, newFile, data },
             "*"
@@ -193,7 +231,13 @@ console.log("[sentinel] file_hook (isolated) loaded");
         console.log("[sentinel] file_hook error:", e);
         // fail-open
         window.postMessage(
-          { type: "SENTINEL_FILE_RESULT", id, allow: true, fail_open: true, error: String(e?.message || e) },
+          {
+            type: "SENTINEL_FILE_RESULT",
+            id,
+            allow: true,
+            fail_open: true,
+            error: String(e?.message || e),
+          },
           "*"
         );
       }
