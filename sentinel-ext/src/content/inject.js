@@ -3,7 +3,7 @@ console.log("[sentinel] inject loaded", location.href);
 
 (() => {
   // -------------------------
-  // Storage keys (SW와 반드시 동일)
+  // Storage keys (SW와 반드시 동일) 
   // -------------------------
   const STORAGE_KEYS = {
     enabled: "sentinel_enabled",
