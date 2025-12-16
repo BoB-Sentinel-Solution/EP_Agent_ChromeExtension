@@ -81,28 +81,7 @@
   "web_accessible_resources": [
     {
       "resources": ["src/content/file_hook_main.js"],
-      "matches": [
-        "https://chatgpt.com/*",
-        "https://chat.openai.com/*",
-        "https://gemini.google.com/*",
-        "https://claude.ai/*",
-        "https://chat.deepseek.com/*",
-        "https://deepseek.com/*",
-        "https://groq.com/*",
-        "https://console.groq.com/*",
-        "https://grok.com/*",
-        "https://www.perplexity.ai/*",
-        "https://perplexity.ai/*",
-        "https://poe.com/*",
-        "https://chat.mistral.ai/*",
-        "https://cohere.com/*",
-        "https://*.cohere.com/*",
-        "https://huggingface.co/chat/*",
-        "https://meta.ai/*",
-        "https://you.com/*",
-        "https://phind.com/*",
-        "https://openrouter.ai/*"
-      ]
+      "matches": ["https://*/*"]
     }
   ],
 

@@ -1,209 +1,178 @@
 // src/content/file_hook_main.js
 (() => {
-  const SENTINEL_FLAG = "__sentinel";
-  const REQ_TYPE = "SENTINEL_REDACT_FILE";
-  const RES_TYPE = "SENTINEL_REDACT_FILE_RESULT";
+  console.log("[sentinel] file_hook_main (network wrapper) loaded");
 
-  const ALLOWED_EXT = new Set([
-    "png","jpg","jpeg","webp",
-    "pdf","docx","pptx","csv","txt","xlsx",
-  ]);
+  let seq = 0;
 
-  const MIME = {
-    png:  "image/png",
-    jpg:  "image/jpeg",
-    jpeg: "image/jpeg",
-    webp: "image/webp",
-    pdf:  "application/pdf",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    csv:  "text/csv",
-    txt:  "text/plain",
-  };
+  function waitFileDecision(file, timeoutMs = 15000) {
+    const id = `${Date.now()}-${++seq}`;
 
-  function normalizeExt(ext) {
-    return String(ext || "").trim().toLowerCase().replace(/^\./, "");
-  }
-
-  function extFromFilename(name) {
-    const s = String(name || "");
-    const m = s.toLowerCase().match(/\.([a-z0-9]+)$/);
-    return m ? normalizeExt(m[1]) : "";
-  }
-
-  function mimeFromExt(ext) {
-    return MIME[normalizeExt(ext)] || "application/octet-stream";
-  }
-
-  function ensureFilenameWithExt(filename, ext) {
-    const e = normalizeExt(ext);
-    const base = String(filename || "file").replace(/\.[a-z0-9]+$/i, "");
-    return e ? `${base}.${e}` : base;
-  }
-
-  function arrayBufferToBase64(buf) {
-    const bytes = new Uint8Array(buf);
-    const chunkSize = 0x8000;
-    let binary = "";
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-  }
-
-  function base64ToArrayBuffer(b64) {
-    const binary = atob(String(b64 || ""));
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-
-  function shouldSkipUrl(url) {
-    // Sentinel 서버로 보내는 요청은 후킹 제외(루프 방지)
-    try {
-      const u = new URL(url, location.href);
-      return u.hostname.endsWith("bobsentinel.com") || u.hostname.endsWith("bobsentinel.site");
-    } catch {
-      return false;
-    }
-  }
-
-  async function extractFirstAllowedFileFromFormData(fd) {
-    let found = null;
-
-    for (const [key, value] of fd.entries()) {
-      if (value instanceof File) {
-        const ext = extFromFilename(value.name);
-        if (ALLOWED_EXT.has(ext)) {
-          if (found) {
-            // 배열로 안 보내는 정책이라 "추가 파일"은 일단 경고만(필요하면 여기서 차단 정책으로 바꿀 수 있음)
-            console.warn("[sentinel] multiple allowed files detected; only the first one will be processed.");
-            continue;
-          }
-          found = { field: key, file: value, ext };
-        }
-      }
-    }
-
-    return found;
-  }
-
-  function rebuildFormDataWithReplacedFile(fd, targetField, newFile) {
-    const newFd = new FormData();
-    for (const [key, value] of fd.entries()) {
-      if (key === targetField && value instanceof File) {
-        newFd.append(key, newFile, newFile.name);
-      } else {
-        newFd.append(key, value);
-      }
-    }
-    return newFd;
-  }
-
-  function waitForDecision(requestId, timeoutMs) {
     return new Promise((resolve) => {
+      let done = false;
+
       const timer = setTimeout(() => {
-        cleanup();
-        resolve(null); // fail-open
+        if (done) return;
+        done = true;
+        window.removeEventListener("message", onMsg);
+        resolve({ id, allow: true, fail_open: true, reason: "timeout" });
       }, timeoutMs);
 
-      function onMessage(ev) {
-        const msg = ev && ev.data;
-        if (!msg || msg[SENTINEL_FLAG] !== true) return;
-        if (msg.type !== RES_TYPE) return;
-        if (msg.request_id !== requestId) return;
+      function onMsg(ev) {
+        if (ev.source !== window) return;
+        const msg = ev.data;
+        if (!msg || msg.type !== "SENTINEL_FILE_RESULT" || msg.id !== id) return;
 
-        cleanup();
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        window.removeEventListener("message", onMsg);
         resolve(msg);
       }
 
-      function cleanup() {
-        clearTimeout(timer);
-        window.removeEventListener("message", onMessage);
-      }
-
-      window.addEventListener("message", onMessage);
+      window.addEventListener("message", onMsg, true);
+      window.postMessage({ type: "SENTINEL_FILE_HOOK", id, file }, "*");
     });
   }
 
-  const origFetch = window.fetch.bind(window);
-
-  window.fetch = async function(input, init) {
+  function findFirstFileInFormData(fd) {
     try {
-      const url = (typeof input === "string") ? input : (input && input.url) ? input.url : "";
-      if (url && shouldSkipUrl(url)) {
-        return origFetch(input, init);
+      for (const [key, val] of fd.entries()) {
+        if (val instanceof File) return { key, file: val };
       }
+    } catch {}
+    return null;
+  }
 
+  function replaceFirstFileInFormData(fd, newFile) {
+    const hit = findFirstFileInFormData(fd);
+    if (!hit) return fd;
+
+    const out = new FormData();
+    for (const [k, v] of fd.entries()) {
+      if (k === hit.key && v instanceof File) {
+        out.append(k, newFile, newFile.name);
+      } else {
+        out.append(k, v);
+      }
+    }
+    return out;
+  }
+
+  // -------------------------
+  // fetch wrapper
+  // -------------------------
+  const _fetch = window.fetch;
+  window.fetch = async function (input, init) {
+    try {
       const body = init && init.body;
-      if (!(body instanceof FormData)) {
-        return origFetch(input, init);
+
+      // FormData에 File이 있으면 사전검사
+      if (body instanceof FormData) {
+        const hit = findFirstFileInFormData(body);
+        if (!hit) return _fetch.apply(this, arguments);
+
+        console.log("[sentinel] fetch upload detected:", hit.file?.name, hit.file?.size);
+
+        const decision = await waitFileDecision(hit.file);
+        if (decision.allow === false) {
+          console.log("[sentinel] fetch upload BLOCKED by policy");
+          throw new Error("blocked_by_policy");
+        }
+
+        if (decision.file_change && decision.newFile instanceof File) {
+          const newBody = replaceFirstFileInFormData(body, decision.newFile);
+          const newInit = { ...(init || {}), body: newBody };
+          console.log("[sentinel] fetch upload REPLACED:", decision.newFile.name, decision.newFile.size);
+          return _fetch.call(this, input, newInit);
+        }
+
+        return _fetch.apply(this, arguments);
       }
 
-      const found = await extractFirstAllowedFileFromFormData(body);
-      if (!found) {
-        return origFetch(input, init);
+      // 단일 File/Blob 업로드
+      if (body instanceof File) {
+        console.log("[sentinel] fetch file detected:", body.name, body.size);
+
+        const decision = await waitFileDecision(body);
+        if (decision.allow === false) throw new Error("blocked_by_policy");
+
+        if (decision.file_change && decision.newFile instanceof File) {
+          const newInit = { ...(init || {}), body: decision.newFile };
+          console.log("[sentinel] fetch file REPLACED:", decision.newFile.name, decision.newFile.size);
+          return _fetch.call(this, input, newInit);
+        }
+
+        return _fetch.apply(this, arguments);
       }
 
-      const requestId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + "-" + Math.random();
-
-      // File -> base64 attachment
-      const buf = await found.file.arrayBuffer();
-      const attachment = {
-        format: found.ext,
-        data: arrayBufferToBase64(buf),
-        size: found.file.size >>> 0,
-      };
-
-      // ask ISOLATED world to call SW -> server
-      window.postMessage({
-        [SENTINEL_FLAG]: true,
-        type: REQ_TYPE,
-        request_id: requestId,
-        host: location.host,
-        upload_url: url,
-        method: (init && init.method) ? String(init.method).toUpperCase() : "POST",
-        file_field: found.field,
-        file_name: found.file.name,
-        file_type: found.file.type || mimeFromExt(found.ext),
-        attachment,
-      }, "*");
-
-      const decision = await waitForDecision(requestId, 10_000);
-      if (!decision || decision.ok !== true) {
-        // fail-open: 원본 그대로 전송
-        return origFetch(input, init);
-      }
-
-      if (decision.block === true) {
-        // 업로드 차단: 페이지에는 실패로 보이게
-        return new Response("", { status: 403, statusText: "Blocked by Sentinel" });
-      }
-
-      if (decision.replace === true && decision.attachment && decision.attachment.data && decision.attachment.format) {
-        const fmt = normalizeExt(decision.attachment.format);
-        const newName = ensureFilenameWithExt(found.file.name, fmt);
-        const mime = mimeFromExt(fmt);
-
-        const outBuf = base64ToArrayBuffer(decision.attachment.data);
-        const outBlob = new Blob([outBuf], { type: mime });
-        const outFile = new File([outBlob], newName, { type: mime, lastModified: Date.now() });
-
-        const newFd = rebuildFormDataWithReplacedFile(body, found.field, outFile);
-        const newInit = Object.assign({}, init, { body: newFd });
-
-        return origFetch(input, newInit);
-      }
-
-      // replace 아님: 원본 그대로 전송
-      return origFetch(input, init);
+      return _fetch.apply(this, arguments);
     } catch (e) {
-      // fail-open (깨짐 방지)
-      return origFetch(input, init);
+      throw e;
     }
   };
 
-  console.log("[sentinel] file_hook_main (fetch wrapper) installed");
+  console.log("[sentinel] file_hook_main: fetch wrapper installed");
+
+  // -------------------------
+  // XHR wrapper
+  // -------------------------
+  const XHR = window.XMLHttpRequest;
+  const _open = XHR.prototype.open;
+  const _send = XHR.prototype.send;
+
+  XHR.prototype.open = function (method, url) {
+    this.__sentinel_method = method;
+    this.__sentinel_url = url;
+    return _open.apply(this, arguments);
+  };
+
+  XHR.prototype.send = async function (body) {
+    try {
+      if (body instanceof FormData) {
+        const hit = findFirstFileInFormData(body);
+        if (!hit) return _send.apply(this, arguments);
+
+        console.log("[sentinel] XHR upload detected:", hit.file?.name, hit.file?.size);
+
+        const decision = await waitFileDecision(hit.file);
+        if (decision.allow === false) {
+          console.log("[sentinel] XHR upload BLOCKED by policy");
+          // abort + throw는 UI에 영향. 일단 abort로 끊음.
+          try { this.abort(); } catch {}
+          throw new Error("blocked_by_policy");
+        }
+
+        if (decision.file_change && decision.newFile instanceof File) {
+          const newBody = replaceFirstFileInFormData(body, decision.newFile);
+          console.log("[sentinel] XHR upload REPLACED:", decision.newFile.name, decision.newFile.size);
+          return _send.call(this, newBody);
+        }
+
+        return _send.apply(this, arguments);
+      }
+
+      if (body instanceof File) {
+        console.log("[sentinel] XHR file detected:", body.name, body.size);
+
+        const decision = await waitFileDecision(body);
+        if (decision.allow === false) {
+          try { this.abort(); } catch {}
+          throw new Error("blocked_by_policy");
+        }
+
+        if (decision.file_change && decision.newFile instanceof File) {
+          console.log("[sentinel] XHR file REPLACED:", decision.newFile.name, decision.newFile.size);
+          return _send.call(this, decision.newFile);
+        }
+
+        return _send.apply(this, arguments);
+      }
+
+      return _send.apply(this, arguments);
+    } catch (e) {
+      throw e;
+    }
+  };
+
+  console.log("[sentinel] file_hook_main: XHR wrapper installed");
 })();

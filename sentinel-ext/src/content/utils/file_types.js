@@ -1,57 +1,54 @@
 // src/content/utils/file_types.js
 (() => {
-  const ALLOWED = {
-    // images
-    png:  "image/png",
-    jpg:  "image/jpeg",
-    jpeg: "image/jpeg",
-    webp: "image/webp",
-    // docs
-    pdf:  "application/pdf",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    csv:  "text/csv",
-    txt:  "text/plain",
-  };
+  const ALLOWED = new Set([
+    "png", "jpg", "jpeg", "webp",
+    "pdf", "docx", "pptx", "csv", "txt", "xlsx",
+  ]);
 
-  function normalizeExt(ext) {
-    return String(ext || "")
-      .trim()
-      .toLowerCase()
-      .replace(/^\./, "");
+  function extFromName(name) {
+    const s = String(name || "").toLowerCase();
+    const idx = s.lastIndexOf(".");
+    if (idx < 0) return "";
+    return s.slice(idx + 1).trim();
   }
 
-  function extFromFilename(name) {
-    const s = String(name || "");
-    const m = s.toLowerCase().match(/\.([a-z0-9]+)$/);
-    return m ? normalizeExt(m[1]) : "";
+  function normalizeFormat(ext) {
+    const e = String(ext || "").toLowerCase();
+    if (e === "jpeg") return "jpg"; // 내부 표준을 jpg로
+    return e;
   }
 
-  function isAllowedExt(ext) {
-    const e = normalizeExt(ext);
-    return !!ALLOWED[e];
+  function getFormatFromFileName(fileName) {
+    const ext = extFromName(fileName);
+    const fmt = normalizeFormat(ext);
+    return fmt || null;
   }
 
-  function mimeFromExt(ext) {
-    const e = normalizeExt(ext);
-    return ALLOWED[e] || "application/octet-stream";
+  function isSupportedFormat(fmt) {
+    if (!fmt) return false;
+    return ALLOWED.has(String(fmt).toLowerCase());
   }
 
-  function ensureFilenameWithExt(filename, ext) {
-    const e = normalizeExt(ext);
-    const base = String(filename || "file").replace(/\.[a-z0-9]+$/i, "");
-    if (!e) return base;
-    return `${base}.${e}`;
+  function guessMime(fmt) {
+    const f = String(fmt || "").toLowerCase();
+    switch (f) {
+      case "png": return "image/png";
+      case "jpg": return "image/jpeg";
+      case "webp": return "image/webp";
+      case "pdf": return "application/pdf";
+      case "docx": return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+      case "pptx": return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+      case "xlsx": return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+      case "csv": return "text/csv";
+      case "txt": return "text/plain";
+      default: return "application/octet-stream";
+    }
   }
 
-  // expose
-  window.SentinelFileTypes = {
+  window.__SENTINEL_FILE_TYPES = {
     ALLOWED,
-    normalizeExt,
-    extFromFilename,
-    isAllowedExt,
-    mimeFromExt,
-    ensureFilenameWithExt,
+    getFormatFromFileName,
+    isSupportedFormat,
+    guessMime,
   };
 })();

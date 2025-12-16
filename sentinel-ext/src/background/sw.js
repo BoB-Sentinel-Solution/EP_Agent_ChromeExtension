@@ -1,7 +1,6 @@
 // src/background/sw.js
 console.log("[sentinel] sw loaded");
 
-// inject.js와 동일 키
 const STORAGE_KEYS = {
   enabled: "sentinel_enabled",
   endpointUrl: "sentinel_endpoint_url",
@@ -19,14 +18,34 @@ async function getSettings() {
   ]);
 
   return {
-    enabled: data[STORAGE_KEYS.enabled] !== false, // default true
+    enabled: data[STORAGE_KEYS.enabled] !== false,
     endpointUrl: data[STORAGE_KEYS.endpointUrl] || DEFAULT_ENDPOINT,
   };
 }
 
+function summarizePayload(payload) {
+  try {
+    const a = payload?.attachment || {};
+    return {
+      time: payload?.time,
+      host: payload?.host,
+      PCName: payload?.PCName,
+      prompt_len: String(payload?.prompt || "").length,
+      attachment: {
+        format: a?.format ?? null,
+        size: typeof a?.size === "number" ? a.size : null,
+        has_data: !!a?.data,
+      },
+      interface: payload?.interface,
+    };
+  } catch {
+    return { note: "payload_summary_failed" };
+  }
+}
+
 async function postJson(url, payload) {
   console.log("[sentinel] POST ->", url);
-  console.log("[sentinel] payload ->", payload);
+  console.log("[sentinel] payload(summary) ->", summarizePayload(payload));
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -66,20 +85,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       if (!msg) return;
+      if (msg.type !== "SENTINEL_PROCESS") return;
 
-      // ✅ 기존 + 파일 레댁션 메시지 타입 추가 (최소 변경)
-      const isSupported =
-        msg.type === "SENTINEL_PROCESS" ||
-        msg.type === "SENTINEL_REDACT_FILE";
-
-      if (!isSupported) return;
-
-      console.log(
-        "[sentinel] onMessage:",
-        msg.type,
-        "from",
-        sender?.url || "unknown"
-      );
+      console.log("[sentinel] onMessage:", msg.type, "from", sender?.url || "unknown");
 
       const settings = await getSettings();
       if (!settings.enabled) {
@@ -88,8 +96,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       const { ok, status, data } = await postJson(settings.endpointUrl, msg.payload);
-
-      // content가 그대로 쓰게 서버 응답 JSON을 data로 전달
       sendResponse({ ok, status, data });
     } catch (e) {
       console.log("[sentinel] sw error:", e);
@@ -97,5 +103,5 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
   })();
 
-  return true; // async response
+  return true;
 });
