@@ -1,5 +1,5 @@
 // src/ui/popup.js
-import { getSettings, setSettings } from "../lib/storage.js";
+import { getSettings } from "../lib/storage.js";
 import { ensureIdentity } from "../lib/identity.js";
 
 const $pcName = document.getElementById("pcName");
@@ -14,11 +14,10 @@ async function render() {
   $pcName.textContent = pcName;
   $endpoint.textContent = s.endpointUrl;
   $enabled.checked = !!s.enabled;
-}
 
-$enabled.addEventListener("change", async () => {
-  await setSettings({ enabled: $enabled.checked });
-});
+  // ✅ 팝업은 표시 전용 (변경은 Options에서)
+  $enabled.disabled = true;
+}
 
 $openOptions.addEventListener("click", () => {
   chrome.runtime.openOptionsPage();

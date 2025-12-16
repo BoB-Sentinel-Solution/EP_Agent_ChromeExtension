@@ -47,7 +47,8 @@ export async function getSettings() {
 
   // sentinel 키가 비어있고 legacy 값이 있으면 한 번 저장(마이그레이션)
   const needMigrate =
-    !got[STORAGE_KEYS.endpointUrl] && (got.endpointUrl || got.enabled !== undefined || got.deviceId || got.pcName);
+    !got[STORAGE_KEYS.endpointUrl] &&
+    (got.endpointUrl || got.enabled !== undefined || got.deviceId || got.pcName);
 
   if (needMigrate) {
     await chrome.storage.local.set({
@@ -63,14 +64,31 @@ export async function getSettings() {
 }
 
 export async function setSettings(patch) {
-  // UI patch를 sentinel 키로 변환해서 저장
+  // ✅ 최소 수정: sentinel_* 저장 + legacy 키도 같이 저장해서 UI/팝업/기존 코드와 호환 유지
   const out = {};
 
-  if (patch.enabled !== undefined) out[STORAGE_KEYS.enabled] = !!patch.enabled;
-  if (patch.endpointUrl !== undefined) out[STORAGE_KEYS.endpointUrl] = String(patch.endpointUrl);
+  if (patch.enabled !== undefined) {
+    const v = !!patch.enabled;
+    out[STORAGE_KEYS.enabled] = v;
+    out.enabled = v; // legacy
+  }
 
-  if (patch.uuid !== undefined) out[STORAGE_KEYS.uuid] = patch.uuid;
-  if (patch.pcName !== undefined) out[STORAGE_KEYS.pcName] = patch.pcName;
+  if (patch.endpointUrl !== undefined) {
+    const v = String(patch.endpointUrl);
+    out[STORAGE_KEYS.endpointUrl] = v;
+    out.endpointUrl = v; // legacy
+  }
+
+  // UI에서 uuid/pcName을 patch로 넘길 수도 있으니 둘 다 동기화
+  if (patch.uuid !== undefined) {
+    out[STORAGE_KEYS.uuid] = patch.uuid;
+    out.deviceId = patch.uuid; // legacy
+  }
+
+  if (patch.pcName !== undefined) {
+    out[STORAGE_KEYS.pcName] = patch.pcName;
+    out.pcName = patch.pcName; // legacy
+  }
 
   await chrome.storage.local.set(out);
 }
