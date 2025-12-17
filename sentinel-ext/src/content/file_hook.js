@@ -88,10 +88,7 @@ console.log("[sentinel] file_hook (isolated) loaded");
   // -------------------------
   (function injectMainHook() {
     try {
-      if (window.__SENTINEL_FILE_HOOK_MAIN_INJECTED) {
-        // 중복 주입 방지
-        return;
-      }
+      if (window.__SENTINEL_FILE_HOOK_MAIN_INJECTED) return;
       window.__SENTINEL_FILE_HOOK_MAIN_INJECTED = true;
 
       const src = chrome.runtime.getURL("src/content/file_hook_main.js");
@@ -120,22 +117,9 @@ console.log("[sentinel] file_hook (isolated) loaded");
     return { FT, FC };
   }
 
-  // ✅ File/Blob duck-typing (Gemini blob 업로드 대응)
+  // ✅ File/Blob realm 이슈 대비: duck-typing + Blob 허용
   function isBlobLike(x) {
-    return !!(
-      x &&
-      typeof x.size === "number" &&
-      typeof x.type === "string" &&
-      (typeof x.arrayBuffer === "function" || typeof x.stream === "function")
-    );
-  }
-
-  function getNameHint(x) {
-    // File이면 name 존재. Blob이면 보통 name 없음.
-    try {
-      if (x && typeof x.name === "string" && x.name) return x.name;
-    } catch {}
-    return "";
+    return !!x && typeof x.size === "number" && typeof x.type === "string";
   }
 
   window.addEventListener(
@@ -146,10 +130,22 @@ console.log("[sentinel] file_hook (isolated) loaded");
       if (!msg || msg.type !== "SENTINEL_FILE_HOOK") return;
 
       const id = msg.id;
-      const file = msg.file; // (실제로는 File 또는 Blob)
+      const file = msg.file;
+      const meta = msg.meta || {};
+
+      // ✅ 메시지 수신 디버그 (Gemini에서 이 로그가 떠야 다음 단계로 진행됨)
+      try {
+        console.log("[sentinel] file_hook: got hook msg", {
+          id,
+          kind: file?.constructor?.name,
+          size: file?.size,
+          type: file?.type,
+          name: file?.name,
+          meta,
+        });
+      } catch {}
 
       try {
-        // utils 준비 안됐으면 fail-open
         const { FT, FC } = getUtils();
         if (!FT || !FC) {
           console.log("[sentinel] file_hook: utils missing (FT/FC). fail-open");
@@ -160,36 +156,30 @@ console.log("[sentinel] file_hook (isolated) loaded");
           return;
         }
 
-        // ✅ File/Blob 이 아니면 패스
-        if (!isBlobLike(file)) {
+        // ✅ File/Blob 둘 다 받기 (realm 이슈 대비 duck-typing)
+        const isRealBlob = (typeof Blob !== "undefined") && (file instanceof Blob);
+        if (!isRealBlob && !isBlobLike(file)) {
           window.postMessage(
-            { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "no_blob" },
+            { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "no_file" },
             "*"
           );
           return;
         }
 
-        const fileName = getNameHint(file) || "upload.bin";
+        // ✅ nameHint (Blob은 name이 없을 수 있음)
+        const fileName =
+          (file && file.name) ||
+          meta.nameHint ||
+          "upload.bin";
 
-        // ✅ 1) 이름 기반 확장자 추정
-        let fmt = null;
-        try {
-          fmt = FT.getFormatFromFileName ? FT.getFormatFromFileName(fileName) : null;
-        } catch {
-          fmt = null;
-        }
-
-        // ✅ 2) 이름이 없거나 확장자 판단이 어려우면 MIME(type) 기반 추정
+        // ✅ format 결정: name 우선 → mime(type) fallback
+        let fmt = FT.getFormatFromFileName(fileName);
         if (!fmt) {
-          try {
-            fmt = FT.getFormatFromMimeType ? FT.getFormatFromMimeType(file.type) : null;
-          } catch {
-            fmt = null;
-          }
+          const mime = FT.normalizeMime ? FT.normalizeMime(file?.type || meta.type) : String(file?.type || meta.type || "");
+          fmt = FT.getFormatFromMimeType ? FT.getFormatFromMimeType(mime) : null;
         }
 
-        if (!FT.isSupportedFormat || !FT.isSupportedFormat(fmt)) {
-          // 요구사항: 지원 확장자만 서버로 전송, 나머지는 무시(통과)
+        if (!FT.isSupportedFormat(fmt)) {
           window.postMessage(
             { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "unsupported_format", format: fmt || null },
             "*"
@@ -197,33 +187,8 @@ console.log("[sentinel] file_hook (isolated) loaded");
           return;
         }
 
-        // -------------------------
-        // File/Blob -> attachment(base64)
-        // -------------------------
-        let attachment = null;
-
-        // 1) blob 전용 함수가 있으면 우선 사용
-        if (typeof FC.blobToAttachment === "function") {
-          attachment = await FC.blobToAttachment(file, fmt, fileName);
-        } else if (typeof FC.fileToAttachment === "function") {
-          // 2) File 전용 함수면 Blob을 File로 감싸서 처리
-          //    (Gemini blob 업로드를 여기서 커버)
-          let asFile = file;
-          try {
-            if (!(file instanceof File)) {
-              asFile = new File([file], fileName, { type: file.type || "application/octet-stream" });
-            }
-          } catch (e) {
-            // File 생성이 막히면 codec 쪽에서 blob을 받아야 함
-            console.log("[sentinel] blob->File wrap failed:", e);
-            asFile = null;
-          }
-
-          if (asFile) {
-            attachment = await FC.fileToAttachment(asFile, fmt, fileName);
-          }
-        }
-
+        // ✅ codec는 Blob도 처리 가능 (네가 수정한 file_codec.js 전제)
+        const attachment = await FC.fileToAttachment(file);
         if (!attachment || !attachment.data || !attachment.format) {
           window.postMessage(
             { type: "SENTINEL_FILE_RESULT", id, skipped: true, reason: "codec_failed" },
@@ -243,7 +208,7 @@ console.log("[sentinel] file_hook (isolated) loaded");
           format: attachment.format,
           size: attachment.size,
           name: fileName,
-          mime: String(file.type || ""),
+          mime: file?.type || meta.type || "",
         });
 
         const resp = await new Promise((resolve) => {
@@ -289,7 +254,6 @@ console.log("[sentinel] file_hook (isolated) loaded");
         );
       } catch (e) {
         console.log("[sentinel] file_hook error:", e);
-        // fail-open
         window.postMessage(
           {
             type: "SENTINEL_FILE_RESULT",
