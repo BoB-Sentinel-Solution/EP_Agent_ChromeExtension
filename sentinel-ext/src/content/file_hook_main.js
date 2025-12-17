@@ -18,7 +18,7 @@
   //  - 네트워크 업로드 시점에 같은 파일이면 그 결과를 재사용
   // -------------------------
   const PENDING_TTL_MS = 60_000; // 60초 내 업로드면 같은 파일로 취급
-  const pending = new Map(); // key -> { ts, file, promise }
+  const pending = new Map(); // key -> { ts, file, promise, meta }
 
   function now() {
     return Date.now();
@@ -48,13 +48,19 @@
       const k = fileKey(file);
       if (pending.has(k)) return;
 
+      // ✅ meta를 같이 넘겨서 (Blob로 변환되어도) format 판단 힌트 제공
+      const meta = {
+        nameHint: String(file.name || "upload.bin"),
+        type: String(file.type || ""),
+      };
+
       // 미리 판정 시작 (네트워크 시점에서 재사용)
-      const p = waitFileDecision(file).catch((e) => {
+      const p = waitFileDecision(file, meta).catch((e) => {
         console.log("[sentinel] pending decision error => fail-open", e);
         return { allow: true, fail_open: true, reason: "pending_error" };
       });
 
-      pending.set(k, { ts: now(), file, promise: p });
+      pending.set(k, { ts: now(), file, promise: p, meta });
       console.log("[sentinel] file change captured => pending set:", file.name, file.size);
     } catch {}
   }
@@ -73,8 +79,8 @@
   }
 
   function getPendingDecisionForBlob(blob) {
-    // Blob은 name이 없을 수 있으니 (Gemini 케이스)
-    // size/type 기반으로 최근 pending 중 가장 가까운 것을 매칭
+    // Blob은 name/type이 없을 수 있으니 (Gemini 케이스)
+    // ✅ size + 최신순으로 pending 중 가장 가까운 것을 매칭 (type 비교는 약하게)
     try {
       if (!(blob instanceof Blob)) return null;
       purgePending();
@@ -83,17 +89,28 @@
       const bType = String(blob.type || "");
       const t = now();
 
+      let best = null;
+
       for (const v of pending.values()) {
         if (!v || !v.file) continue;
         const age = t - v.ts;
         if (age > PENDING_TTL_MS) continue;
 
-        // size/type가 같으면 일단 후보로 인정
-        if (Number(v.file.size || 0) === bSize && String(v.file.type || "") === bType) {
-          return v.promise || null;
-        }
+        const fSize = Number(v.file.size || 0);
+        const fType = String(v.file.type || "");
+
+        // ✅ size 우선 매칭
+        if (fSize !== bSize) continue;
+
+        // ✅ type이 둘 다 있으면 같을 때 가산점, 아니면 그냥 통과
+        const typeOk = (!bType || !fType) ? true : (bType === fType);
+        if (!typeOk) continue;
+
+        // 최신 우선
+        if (!best || v.ts > best.ts) best = v;
       }
-      return null;
+
+      return best ? (best.promise || null) : null;
     } catch {
       return null;
     }
@@ -118,7 +135,39 @@
     true
   );
 
-  function waitFileDecision(file, timeoutMs = 15000) {
+  // ✅ drag&drop 업로드 대비 (Gemini가 드래그로 올리는 경우도 많음)
+  window.addEventListener(
+    "drop",
+    (e) => {
+      try {
+        const dt = e?.dataTransfer;
+        const files = dt?.files;
+        if (!files || !files.length) return;
+        for (const f of files) putPending(f);
+      } catch {}
+    },
+    true
+  );
+
+  // ✅ paste 업로드 대비
+  window.addEventListener(
+    "paste",
+    (e) => {
+      try {
+        const items = e?.clipboardData?.items;
+        if (!items || !items.length) return;
+        for (const it of items) {
+          if (it?.kind === "file") {
+            const f = it.getAsFile?.();
+            if (f) putPending(f);
+          }
+        }
+      } catch {}
+    },
+    true
+  );
+
+  function waitFileDecision(file, meta, timeoutMs = 15000) {
     const id = `${Date.now()}-${++seq}`;
 
     return new Promise((resolve) => {
@@ -151,7 +200,8 @@
 
       // ⚠️ isolated world에서 instanceof File이 실패할 수 있어서
       // file_hook.js 쪽은 duck-typing으로 받는게 가장 안전함.
-      window.postMessage({ type: "SENTINEL_FILE_HOOK", id, file }, "*");
+      // ✅ meta(nameHint/type) 같이 전달 (Blob 업로드 시 포맷 판단 힌트)
+      window.postMessage({ type: "SENTINEL_FILE_HOOK", id, file, meta: meta || {} }, "*");
     });
   }
 
@@ -229,7 +279,13 @@
           (v instanceof File ? getPendingDecisionForFile(v) : null) ||
           (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
 
-        const decisionP = pendingP || waitFileDecision(v);
+        // ✅ pending 없으면 meta를 만들어서 직접 검사
+        const meta = {
+          nameHint: String(v?.name || "upload.bin"),
+          type: String(v?.type || ""),
+        };
+
+        const decisionP = pendingP || waitFileDecision(v, meta);
 
         return decisionP.then((decision) => {
           if (decision.allow === false) {
@@ -257,7 +313,12 @@
           (body instanceof File ? getPendingDecisionForFile(body) : null) ||
           (body instanceof Blob ? getPendingDecisionForBlob(body) : null);
 
-        const decisionP = pendingP || waitFileDecision(body);
+        const meta = {
+          nameHint: String(body?.name || "upload.bin"),
+          type: String(body?.type || ""),
+        };
+
+        const decisionP = pendingP || waitFileDecision(body, meta);
 
         return decisionP.then((decision) => {
           if (decision.allow === false) {
@@ -293,7 +354,12 @@
               (v instanceof File ? getPendingDecisionForFile(v) : null) ||
               (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
 
-            const decisionP = pendingP || waitFileDecision(v);
+            const meta = {
+              nameHint: String(v?.name || "upload.bin"),
+              type: String(v?.type || ""),
+            };
+
+            const decisionP = pendingP || waitFileDecision(v, meta);
 
             return decisionP.then((decision) => {
               if (decision.allow === false) {
@@ -352,7 +418,12 @@
           (v instanceof File ? getPendingDecisionForFile(v) : null) ||
           (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
 
-        const decisionP = pendingP || waitFileDecision(v);
+        const meta = {
+          nameHint: String(v?.name || "upload.bin"),
+          type: String(v?.type || ""),
+        };
+
+        const decisionP = pendingP || waitFileDecision(v, meta);
 
         decisionP
           .then((decision) => {
@@ -389,7 +460,12 @@
           (body instanceof File ? getPendingDecisionForFile(body) : null) ||
           (body instanceof Blob ? getPendingDecisionForBlob(body) : null);
 
-        const decisionP = pendingP || waitFileDecision(body);
+        const meta = {
+          nameHint: String(body?.name || "upload.bin"),
+          type: String(body?.type || ""),
+        };
+
+        const decisionP = pendingP || waitFileDecision(body, meta);
 
         decisionP
           .then((decision) => {
