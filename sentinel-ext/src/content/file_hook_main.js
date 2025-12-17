@@ -12,13 +12,10 @@
   let seq = 0;
 
   // -------------------------
-  // ✅ URL 필터: "업로드만 허용"이 아니라 "광고/측정만 제외"
-  //  - ChatGPT/OpenAI 업로드 URL이 다양해서 whitelist 방식이면 깨짐
-  //  - 파일이 body로 실리면 그게 업로드임 → URL은 차단리스트만 적용
+  // ✅ URL 제외(광고/측정만) - CSP 에러/노이즈 줄이기용
   // -------------------------
   function isIgnoredUrl(url) {
     const u = String(url || "");
-    // 광고/측정 계열만 제외
     if (u.includes("googleadservices.com")) return true;
     if (u.includes("doubleclick.net")) return true;
     if (u.includes("googletagmanager.com")) return true;
@@ -28,6 +25,8 @@
 
   // -------------------------
   // pending (선택 시점 File 기록)
+  //  - Gemini는 업로드 시 Blob으로 바뀌는 경우가 많아서
+  //    "선택된 File"을 pending으로 잡아두고 size/type로 매칭
   // -------------------------
   const PENDING_TTL_MS = 60_000;
   const pending = new Map(); // key -> { ts, file, promise, meta }
@@ -82,10 +81,8 @@
 
       window.addEventListener("message", onMsg, true);
 
-      window.postMessage(
-        { type: "SENTINEL_FILE_HOOK", id, file, meta: meta || {} },
-        "*"
-      );
+      // file_hook.js(iso)로 전달
+      window.postMessage({ type: "SENTINEL_FILE_HOOK", id, file, meta: meta || {} }, "*");
     });
   }
 
@@ -108,7 +105,7 @@
       });
 
       pending.set(k, { ts: now(), file, promise: p, meta });
-      console.log("[sentinel] file change captured => pending set:", file.name, file.size);
+      console.log("[sentinel] file selected => pending set:", file.name, file.size);
     } catch {}
   }
 
@@ -116,8 +113,7 @@
     try {
       if (!(file instanceof File)) return null;
       purgePending();
-      const k = fileKey(file);
-      const hit = pending.get(k);
+      const hit = pending.get(fileKey(file));
       return hit ? (hit.promise || null) : null;
     } catch {
       return null;
@@ -125,6 +121,7 @@
   }
 
   function getPendingDecisionForBlob(blob) {
+    // Gemini: File -> Blob로 변환되어 올라가는 케이스 대응
     try {
       if (!(blob instanceof Blob)) return null;
       purgePending();
@@ -145,7 +142,7 @@
 
         if (fSize !== bSize) continue;
 
-        // type이 둘 다 있으면 같을 때만 매칭, 하나라도 비면 size로만 매칭
+        // type이 둘 다 있으면 동일할 때만, 하나라도 비면 size로만 매칭 허용
         const typeOk = (!bType || !fType) ? true : (bType === fType);
         if (!typeOk) continue;
 
@@ -159,33 +156,8 @@
   }
 
   // -------------------------
-  // ✅ input[type=file] 선택 시점 교체 (best-effort)
-  //  - 브라우저 정책상 input.files는 종종 read-only라 실패할 수 있음
-  //  - 실패해도 네트워크(fetch/XHR) 교체가 주력으로 계속 동작하도록 설계
+  // ✅ 이벤트 훅: "막지 말고" pending만 잡는다 (Gemini 안정성 핵심)
   // -------------------------
-  const PATCH_GUARD_MS = 1000;
-
-  function shouldSkipInputPatch(inputEl) {
-    try {
-      const t = now();
-      if (inputEl.__SENTINEL_PATCHING) return true;
-      const last = Number(inputEl.__SENTINEL_LAST_PATCH_TS || 0);
-      if (last && (t - last) < PATCH_GUARD_MS) return true;
-      return false;
-    } catch {
-      return true;
-    }
-  }
-
-  function setInputFilesBestEffort(inputEl, filesArr) {
-    const dt = new DataTransfer();
-    for (const f of filesArr) {
-      if (f instanceof File) dt.items.add(f);
-    }
-    // 일부 사이트/브라우저에서 막힐 수 있음(예외 처리 필요)
-    inputEl.files = dt.files;
-  }
-
   window.addEventListener(
     "change",
     (e) => {
@@ -194,84 +166,21 @@
         if (!el) return;
         if (el.tagName !== "INPUT") return;
         if (String(el.type || "").toLowerCase() !== "file") return;
-        if (shouldSkipInputPatch(el)) return;
 
         const files = el.files;
         if (!files || !files.length) return;
 
-        // 원본 change를 캡처에서 멈추고, 교체 후 재발행 시도
-        e.stopImmediatePropagation();
-        e.stopPropagation();
-
-        el.__SENTINEL_PATCHING = true;
-
-        const originals = Array.from(files);
-
-        for (const f of originals) putPending(f);
-
-        Promise.all(
-          originals.map((f) => {
-            const meta = { nameHint: String(f.name || "upload.bin"), type: String(f.type || "") };
-            const p = getPendingDecisionForFile(f) || waitFileDecision(f, meta);
-            return p.then((decision) => ({ file: f, decision }));
-          })
-        )
-          .then((results) => {
-            const outFiles = [];
-
-            for (const { file, decision } of results) {
-              if (decision && decision.allow === false) {
-                console.log("[sentinel] input-file BLOCKED by policy:", file?.name, file?.size);
-                continue;
-              }
-
-              if (decision && decision.file_change && decision.newFile instanceof File) {
-                console.log("[sentinel] input-file REPLACED:", decision.newFile.name, decision.newFile.size);
-                outFiles.push(decision.newFile);
-              } else {
-                outFiles.push(file);
-              }
-            }
-
-            try {
-              if (!outFiles.length) {
-                try { el.value = ""; } catch {}
-              } else {
-                try {
-                  setInputFilesBestEffort(el, outFiles);
-                } catch (err) {
-                  console.log("[sentinel] input.files assign FAILED (ok, fallback to net replace):", err);
-                }
-              }
-            } finally {
-              el.__SENTINEL_LAST_PATCH_TS = now();
-              el.__SENTINEL_PATCHING = false;
-            }
-
-            // 앱에게 다시 change 전달
-            const ev2 = new Event("change", { bubbles: true });
-            el.dispatchEvent(ev2);
-          })
-          .catch((err) => {
-            console.log("[sentinel] input-file patch error => fail-open:", err);
-            el.__SENTINEL_LAST_PATCH_TS = now();
-            el.__SENTINEL_PATCHING = false;
-
-            const ev2 = new Event("change", { bubbles: true });
-            el.dispatchEvent(ev2);
-          });
+        for (const f of files) putPending(f);
       } catch {}
     },
     true
   );
 
-  // drag/drop, paste는 pending만 유지
   window.addEventListener(
     "drop",
     (e) => {
       try {
-        const dt = e?.dataTransfer;
-        const files = dt?.files;
+        const files = e?.dataTransfer?.files;
         if (!files || !files.length) return;
         for (const f of files) putPending(f);
       } catch {}
@@ -333,37 +242,30 @@
       const method = String(req.method || "GET").toUpperCase();
       if (method === "GET" || method === "HEAD") return null;
 
-      return req
-        .clone()
-        .formData()
-        .then((fd) => ({ ok: true, fd }))
-        .catch(() => null);
+      return req.clone().formData().then((fd) => ({ ok: true, fd })).catch(() => null);
     } catch {
       return null;
     }
   }
 
   // -------------------------
-  // fetch wrapper
+  // fetch wrapper (네트워크 단계 교체)
   // -------------------------
   const _fetch = window.fetch;
 
   window.fetch = function (input, init) {
-    try {
-      const url = (input instanceof Request) ? input.url : String(input || "");
-      if (isIgnoredUrl(url)) return _fetch.apply(this, arguments);
+    const url = input instanceof Request ? input.url : String(input || "");
+    if (isIgnoredUrl(url)) return _fetch.apply(this, arguments);
 
+    try {
       const body = init && init.body;
 
-      // FormData에 File/Blob
+      // FormData 업로드
       if (body instanceof FormData) {
         const hit = findFirstFileLikeInFormData(body);
         if (!hit) return _fetch.apply(this, arguments);
 
         const v = hit.value;
-
-        console.log("[sentinel] fetch upload detected:", v?.name || "(blob)", v?.size, "=>", url);
-
         const pendingP =
           (v instanceof File ? getPendingDecisionForFile(v) : null) ||
           (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
@@ -377,7 +279,7 @@
           if (decision.file_change && decision.newFile instanceof File) {
             const newBody = replaceFirstFileLikeInFormData(body, decision.newFile);
             const newInit = { ...(init || {}), body: newBody };
-            console.log("[sentinel] fetch(upload) REPLACED:", decision.newFile.name, decision.newFile.size);
+            console.log("[sentinel] fetch upload REPLACED:", decision.newFile.name, decision.newFile.size);
             return _fetch.call(this, input, newInit);
           }
 
@@ -385,10 +287,8 @@
         });
       }
 
-      // 단일 File/Blob
+      // 단일 Blob/File 업로드
       if (isFileLike(body)) {
-        console.log("[sentinel] fetch file/blob detected:", body?.name || "(blob)", body?.size, "=>", url);
-
         const pendingP =
           (body instanceof File ? getPendingDecisionForFile(body) : null) ||
           (body instanceof Blob ? getPendingDecisionForBlob(body) : null);
@@ -401,7 +301,7 @@
 
           if (decision.file_change && decision.newFile instanceof File) {
             const newInit = { ...(init || {}), body: decision.newFile };
-            console.log("[sentinel] fetch(file/blob) REPLACED:", decision.newFile.name, decision.newFile.size);
+            console.log("[sentinel] fetch file/blob REPLACED:", decision.newFile.name, decision.newFile.size);
             return _fetch.call(this, input, newInit);
           }
 
@@ -420,9 +320,6 @@
             if (!hit) return _fetch.apply(this, arguments);
 
             const v = hit.value;
-
-            console.log("[sentinel] fetch(Request) upload detected:", v?.name || "(blob)", v?.size, "=>", url);
-
             const pendingP =
               (v instanceof File ? getPendingDecisionForFile(v) : null) ||
               (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
@@ -455,7 +352,7 @@
   console.log("[sentinel] file_hook_main: fetch wrapper installed");
 
   // -------------------------
-  // XHR wrapper
+  // XHR wrapper (네트워크 단계 교체)
   // -------------------------
   const XHR = window.XMLHttpRequest;
   const _open = XHR.prototype.open;
@@ -468,27 +365,16 @@
   };
 
   XHR.prototype.send = function (body) {
+    const url = this.__sentinel_url || "";
+    if (isIgnoredUrl(url)) return _send.apply(this, arguments);
+
     try {
-      const url = this.__sentinel_url || "";
-      if (isIgnoredUrl(url)) return _send.apply(this, arguments);
-
-      if (body instanceof FormData || isFileLike(body)) {
-        console.log("[sentinel] XHR(send/upload) =>", {
-          method: this.__sentinel_method,
-          url,
-          kind: body instanceof FormData ? "FormData" : (body instanceof Blob ? "Blob" : "File"),
-          size: body?.size,
-          type: body?.type,
-        });
-      }
-
       // FormData
       if (body instanceof FormData) {
         const hit = findFirstFileLikeInFormData(body);
         if (!hit) return _send.apply(this, arguments);
 
         const v = hit.value;
-
         const pendingP =
           (v instanceof File ? getPendingDecisionForFile(v) : null) ||
           (v instanceof Blob ? getPendingDecisionForBlob(v) : null);
@@ -520,7 +406,7 @@
         return;
       }
 
-      // 단일 File/Blob
+      // 단일 Blob/File
       if (isFileLike(body)) {
         const pendingP =
           (body instanceof File ? getPendingDecisionForFile(body) : null) ||
