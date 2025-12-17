@@ -2,33 +2,55 @@
 (() => {
   const FT = window.__SENTINEL_FILE_TYPES;
 
-  function readAsDataURL(file) {
+  function readAsDataURL(blob) {
     return new Promise((resolve, reject) => {
       const r = new FileReader();
       r.onerror = () => reject(r.error || new Error("FileReader error"));
       r.onload = () => resolve(String(r.result || ""));
-      r.readAsDataURL(file);
+      r.readAsDataURL(blob);
     });
   }
 
-  async function fileToAttachment(file) {
-    if (!(file instanceof File)) {
-      throw new Error("fileToAttachment: input is not File");
+  // ✅ File 또는 Blob 모두 허용
+  async function fileToAttachment(input) {
+    // Blob도 허용 (File은 Blob의 하위 타입)
+    if (!(input instanceof Blob)) {
+      throw new Error("fileToAttachment: input is not File/Blob");
     }
 
-    const format = FT.getFormatFromFileName(file.name);
+    // -------------------------
+    // format 추정
+    //  1) File이면 name 기반 우선
+    //  2) Blob이면 mime 기반
+    // -------------------------
+    let format = null;
+
+    const isFile = (typeof File !== "undefined") && (input instanceof File);
+    const name = isFile ? String(input.name || "") : "";
+
+    if (isFile && name) {
+      format = FT.getFormatFromFileName(name);
+    }
+
+    // name 기반으로 못 구했으면 mime 기반
+    if (!format) {
+      const mime = FT.normalizeMime ? FT.normalizeMime(input.type) : String(input.type || "");
+      format = FT.getFormatFromMimeType ? FT.getFormatFromMimeType(mime) : null;
+    }
+
     if (!FT.isSupportedFormat(format)) {
       return null;
     }
 
-    const dataUrl = await readAsDataURL(file);
+    const dataUrl = await readAsDataURL(input);
     const comma = dataUrl.indexOf(",");
     const base64 = comma >= 0 ? dataUrl.slice(comma + 1) : "";
 
+    // size: Blob도 size 속성 있음
     return {
       format,
       data: base64,
-      size: file.size >>> 0,
+      size: (input.size >>> 0),
     };
   }
 
