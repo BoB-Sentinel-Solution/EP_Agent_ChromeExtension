@@ -17,7 +17,6 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
 - 서버 응답에 따라
   - **차단**: 알림 표시 후 전송 중단
   - **허용 + 마스킹/치환**: `modified_prompt`로 입력창 내용을 교체한 뒤 전송 재개
-  - **서버 오류/타임아웃**: **Fail-open**(원문 그대로 전송)
 
 ### 파일 업로드 유출 방지 (사전 검사 + 교체)
 - 브라우저에서 파일 선택/드래그&드롭/붙여넣기 시점에 pending으로 기록
@@ -27,7 +26,6 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
 - 서버 응답에 따라
   - **차단**: 업로드 요청 abort 또는 에러로 중단
   - **허용 + 파일 교체**: 서버가 내려준 `attachment`로 업로드 파일을 새 파일로 교체하여 전송
-  - **서버 오류/타임아웃**: **Fail-open**(원본 파일 그대로 업로드)
 
 ---
 
@@ -49,7 +47,6 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
 4. 서버 응답:
    - `allow=false` → 차단 알림
    - `modified_prompt` → 입력창 교체 후 전송
-   - 장애 → fail-open(원문 전송)
 
 ### 데이터 흐름(파일)
 1. 사용자가 파일 선택(change/drop/paste) → pending에 기록  
@@ -59,7 +56,6 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
 5. 서버 응답:
    - `allow=false` → 업로드 중단
    - `attachment.file_change=true` → 파일 교체 후 업로드
-   - 장애/타임아웃 → fail-open(원본 업로드)
 
 ---
 
@@ -93,7 +89,7 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
 - 문서: `pdf`, `docx`, `pptx`, `xlsx`
 - 텍스트: `csv`, `txt`
 
-지원하지 않는 포맷은 `skipped: true (unsupported_format)`로 처리되며 업로드는 기본적으로 방해하지 않습니다(fail-open 성격).
+지원하지 않는 포맷은 `skipped: true (unsupported_format)`로 처리되며 업로드는 기본적으로 방해하지 않습니다.
 
 ---
 
@@ -119,7 +115,7 @@ Sentinel Solution 환경에서 **브라우저(Chrome) 기반 LLM 웹 서비스 �
   - 다른 도메인/경로 사용 시 반드시 `manifest.json > host_permissions`에도 추가해야 합니다.
 - **Enabled**
   - 기본 ON
-  - OFF 시: 프롬프트/파일 모두 서버로 보내지 않고 그대로 전송(fail-open)
+  - OFF 시: 프롬프트/파일 모두 서버로 보내지 않고 그대로 전송
 
 ### 저장 키(chrome.storage.local)
 - `sentinel_enabled`
