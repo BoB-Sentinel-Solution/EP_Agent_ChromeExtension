@@ -25,9 +25,7 @@
     "https://cohere.com/*",
     "https://*.cohere.com/*",
     "https://huggingface.co/*",
-    "https://meta.ai/*",
     "https://you.com/*",
-    "https://phind.com/*",
     "https://openrouter.ai/*"
   ],
 
@@ -62,7 +60,6 @@
         "https://cohere.com/*",
         "https://*.cohere.com/*",
         "https://huggingface.co/*",
-        "https://meta.ai/*",
         "https://you.com/*",
         "https://openrouter.ai/*"
       ],
